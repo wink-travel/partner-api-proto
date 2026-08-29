@@ -1,0 +1,35 @@
+name: validate
+
+# Runs on PRs to this repo — which should only ever touch docs/CI, since proto files are
+# machine-published by monorepo-java's release pipeline (see CONTRIBUTING.md). Still worth linting
+# so a stray manual edit doesn't silently drift from the WIRE_JSON breaking policy documented in
+# buf.yaml.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  buf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: bufbuild/buf-setup-action@v1
+
+      - name: buf lint
+        run: buf lint
+
+      - name: buf breaking (against previous release tag)
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
+          if [ -z "$PREV_TAG" ]; then
+            echo "No previous release tag yet — skipping breaking check."
+            exit 0
+          fi
+          buf breaking --against ".git#tag=${PREV_TAG}"

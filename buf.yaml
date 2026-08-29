@@ -1,0 +1,18 @@
+version: v2
+modules:
+  - path: proto
+    name: buf.build/wink-travel/partner-grpc
+deps:
+  # google/api/annotations.proto, google/api/http.proto, google/type/*.proto etc. — declared as a
+  # dependency rather than vendored, so partners resolve them the same way any buf consumer would.
+  - buf.build/googleapis/googleapis
+# Deliberately no `lint:` section — see the equivalent note in monorepo-java's grpc/grpc-proto/buf.yaml:
+# buf's default naming rules would flag every existing service name and directory-matches-package
+# convention already in production use; "fixing" that means renaming live RPCs.
+breaking:
+  use:
+    # WIRE_JSON, not the stricter FILE: this contract is also served as JSON (the Partner OpenAPI
+    # doc generated from these same descriptors), so a field RENAME breaks integrators' JSON parsing
+    # the same way a removal would, even though raw protobuf binary wire compatibility doesn't care
+    # about names. Plain WIRE would let a rename like hero_image -> hero_image_url through silently.
+    - WIRE_JSON
