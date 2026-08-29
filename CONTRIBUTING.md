@@ -26,3 +26,8 @@ it goes through the normal review + `buf breaking` gate before being mirrored ou
 
 PRs to this repo (documentation, README, CI config — not proto files) are linted with `buf lint`
 and `buf breaking` against the previous release via `.github/workflows/validate.yml`.
+
+## How releases actually get published (Wink engineers)
+
+See [docs/BAMBOO_PIPELINE.md](docs/BAMBOO_PIPELINE.md) for the Bamboo stage in `monorepo-java` that
+publishes releases here, its required secrets/agent tooling, and the trigger it must be wired to.
