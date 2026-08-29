@@ -2,9 +2,10 @@
 
 **This repository is a generated mirror.** The source of truth for these contracts is
 `grpc/grpc-proto/src/main/protobuf` in Wink's internal `monorepo-java` repository. Every commit on
-`main` here is produced by an automated release job (`publishPartnerProtoContracts.bash`) that runs
-as part of that repo's production Bamboo pipeline — see its `main` branch for the authoritative
-history, PR discussion, and design rationale behind every field.
+`master` here is produced by an automated release job (`publishPartnerProtoContracts.bash`) that
+runs as part of that repo's production Bamboo pipeline — see `monorepo-java`'s own history (feature
+branches merge to `develop`, releases cut to `master` via GitFlow) for the authoritative PR
+discussion and design rationale behind every field.
 
 ## Why not mirror full history?
 
