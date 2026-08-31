@@ -35,8 +35,10 @@ protoc -I proto --java_out=... proto/travel/wink/grpc/v1/*.proto
 ## Human-readable API reference
 
 This repo is the wire contract, not the documentation. For the browsable REST/JSON-shaped API
-reference (generated from these same protobuf descriptors at build time), see the Partner API docs
-published from `monorepo-java`'s `open-api/open-api-grpc` module.
+reference (generated from these same protobuf descriptors at build time), see the
+[Partner API docs](https://wink.travel/partner-api/partner), published from `monorepo-java`'s
+`open-api/open-api-grpc` module. That page goes live with the next release — see
+[Versioning & release process](#versioning--release-process) below.
 
 ## Versioning & release process
 
