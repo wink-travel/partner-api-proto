@@ -6,9 +6,28 @@ deps:
   # google/api/annotations.proto, google/api/http.proto, google/type/*.proto etc. — declared as a
   # dependency rather than vendored, so partners resolve them the same way any buf consumer would.
   - buf.build/googleapis/googleapis
-# Deliberately no `lint:` section — see the equivalent note in monorepo-java's grpc/grpc-proto/buf.yaml:
-# buf's default naming rules would flag every existing service name and directory-matches-package
-# convention already in production use; "fixing" that means renaming live RPCs.
+# Lint is enforced, and the `use`/`except` below is deliberate — do NOT delete this block thinking
+# it disables linting. Omitting `lint:` in buf v2 does NOT turn lint off; it applies the STANDARD
+# rule set. An earlier version of this file said "deliberately no lint section" and meant "lint is
+# off", which was wrong: the first run of publishPartnerProtoContracts.bash's `buf lint` gate failed
+# on 23 pre-existing errors, on the release path, with nothing yet published.
+#
+# Keep this in sync with monorepo-java's grpc/grpc-proto/buf.yaml — that is the source of truth for
+# the contract, this file gates the same tree after it is staged here, and the two disagreeing is
+# what produced that failure.
+#
+# Every STANDARD rule is live except SERVICE_SUFFIX. The layout rules that used to fail
+# (PACKAGE_DIRECTORY_MATCH, DIRECTORY_SAME_PACKAGE) are satisfied by the directory layout instead of
+# excepted: files live under a path matching their proto package (wink/partner/v1, wink/grpc/v1).
+lint:
+  use:
+    - STANDARD
+  except:
+    # Renaming Inventory -> InventoryService (and Search, Content, Booking, Lookup, Accounts,
+    # Diagnostics) changes the gRPC method path /wink.partner.v1.Inventory/GetX that clients route
+    # on. That is precisely the breaking change the `breaking:` gate below exists to catch, so it
+    # cannot ride in as a lint fix. Revisit only as a deliberate, separately-scoped migration.
+    - SERVICE_SUFFIX
 breaking:
   use:
     # WIRE_JSON, not the stricter FILE: this contract is also served as JSON (the Partner OpenAPI

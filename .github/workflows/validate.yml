@@ -23,7 +23,15 @@ jobs:
       - uses: bufbuild/buf-setup-action@v1
 
       - name: buf lint
-        run: buf lint
+        run: |
+          # Pre-release, proto/ holds only README.md and buf fails the module outright with
+          # "had no .proto files" — which would make every docs/CI PR here red for a reason that
+          # has nothing to do with the PR. Once the first release publishes, this guard is inert.
+          if ! find proto -name '*.proto' -type f | grep -q .; then
+            echo "No .proto files published yet — skipping lint."
+            exit 0
+          fi
+          buf lint
 
       - name: buf breaking (against previous release tag)
         run: |
