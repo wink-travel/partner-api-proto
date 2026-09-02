@@ -1,0 +1,44 @@
+// Copyright (c) 2026 Wink.
+syntax = "proto3";
+
+package wink.grpc.v1;
+
+option java_package = "travel.wink.grpc.v1";
+option java_multiple_files = true;
+option java_outer_classname = "DiagnosticsProto";
+
+// An authenticated echo probe, implemented independently by each gRPC surface.
+//
+// This is the end-to-end proof that a surface's gRPC stack is wired correctly: codegen (protoc +
+// grpc-java), transport (grpc-servlet-jakarta on the app's existing Tomcat HTTP/2 connector),
+// security (the same OAuth2 JWT resource server that guards the REST API), and discoverability
+// (server reflection). It carries no business data and is NOT usage-metered.
+//
+// The CONTRACT lives here so every surface probes the same way; each IMPLEMENTATION lives in that
+// surface's own module. Never implement it in a shared module: all four Spring Boot apps
+// component-scan the whole of `travel.wink`, so a BindableService bean in a shared jar would be
+// silently registered by every app that ever depends on it.
+service Diagnostics {
+  rpc Echo (EchoRequest) returns (EchoResponse) {}
+}
+
+message EchoRequest {
+  // Echoed back verbatim.
+  string message = 1;
+}
+
+message EchoResponse {
+  // Echoed verbatim from the request.
+  string message = 1;
+
+  // The authenticated subject resolved from the bearer JWT.
+  //
+  // A non-empty value here is the actual assertion: it proves the servlet SecurityFilterChain
+  // authenticated the call AND that SecurityContextServerInterceptor propagated the SecurityContext
+  // onto the gRPC callback thread. Without that propagation, @PreAuthorize on a service method would
+  // silently see an anonymous principal.
+  string authenticated_subject = 2;
+
+  // Server-side wall clock (ISO-8601 instant), so a caller can confirm the RPC really reached this JVM.
+  string server_time = 3;
+}

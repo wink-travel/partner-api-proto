@@ -1,0 +1,889 @@
+// Copyright (c) 2026 Wink.
+syntax = "proto3";
+
+package wink.partner.v1;
+
+import "wink/partner/v1/partner_common.proto";
+
+option java_package = "travel.wink.grpc.v1";
+option java_multiple_files = true;
+option java_outer_classname = "PartnerBookingProto";
+
+// MAINTAINER NOTES — not part of the published document.
+//
+// Separated from the next declaration by a BLANK LINE so protoc classifies this as
+// `leading_detached_comments`; GrpcOpenApiGenerator reads only `leading_comments`.
+//
+// REPLACES the REST AgentBookingController (booking/booking-web). Those seven endpoints are deprecated
+// with `Sunset: Wed, 01 Oct 2026`, matching the reference-data retirement in 0ae7b5be7e.
+//
+// NOT METERED, deliberately, and that is a decision rather than an oversight. booking-domain carries no
+// @Metered, so this surface stays free while it sits in a document branded as the paid Partner Integrator
+// API. If it is ever meant to bill, the meter goes on the DOMAIN service (the "one meter, two transports"
+// arrangement PartnerContentServiceImpl uses), never on the gRPC service — otherwise the REST twin bills
+// differently from the gRPC one for the same work.
+//
+// AUTHORIZATION IS TWO INDEPENDENT LAYERS, and porting only one is a silent hole. The REST controller
+// carries @RequireManagingEntityType(TRAVEL_AGENT) at CLASS level AND a per-method BOOKING:READ/WRITE
+// permission. Both must pass: an account holding BOOKING:WRITE that is not a travel agent is rejected. A
+// gRPC service can carry neither annotation (bindService() captures raw `this`, so method-security advice
+// is skipped, and `idParam` binds by parameter name which a request message does not have), so every rpc
+// calls AccountPermissionGuard.requireTravelAgent AND the matching permission guard explicitly. Dropping
+// the first is not a compile error and not a test failure — it just quietly widens who can book.
+//
+// @JsonView IS NOT A CONTRACT AND IS IGNORED HERE. It is a REST serialization concern; a gRPC surface
+// decides what it publishes on its own merits, deliberately, field by field. Do not reach for a view to
+// answer "should this be exposed" — the answer is the note below, and if it is not covered there, decide
+// and write it down rather than inheriting whatever the REST layer happened to allow.
+//
+// That inheritance is precisely the trap. `Views.Agent` extends `Views.Authenticated_Entity`, so the REST
+// endpoints this replaces serve an agent SIXTY of BookingLightweight's 61 fields — everything except
+// supplier `metadata`. Nobody chose that; it fell out of a class hierarchy.
+//
+// WHY THIS IS A PROJECTION AND NOT A MIRROR OF BookingLightweight. That DTO is 1,103 lines carrying 61
+// fields. Mirroring it would publish, as a permanent wire contract:
+// Stripe payment-intent ids, Wink's own platform-fee percentages, the SUPPLIER's agency-fee percentages,
+// payment-processing economics, payout records, ledger state flags, the traveller's browsing session, and
+// three internal reporting projections. None of that is an agent's business, several are somebody else's
+// commercial terms, and one is a payment-processor handle.
+//
+// The rule applied below: an agent sees WHAT THEY SOLD, WHAT THEY EARN, and WHAT THEY MUST SERVICE. They
+// do not see the platform's or the supplier's cut, nor payment plumbing. Their own commission is included
+// precisely because it IS theirs.
+//
+// Excluded on purpose — do not "complete" this message by adding them back:
+//   stripe_payment_intent_id, payment_vendor_specific   payment-processor internals
+//   payout_list, funds_available_date, funds_processed, funds_added_to_ledger   Wink<->supplier ledger
+//   original_supplier_agency_fees_in_percent            the SUPPLIER's cut
+//   total_platform_fee_in_percent(_with_refund)         Wink's cut
+//   total_payment_processing_fee_in_percent(...)        processor economics
+//   financial_breakdown                                 per-beneficiary, includes supplier and platform
+//   user_session                                        the traveller's browsing session
+//   socials, email_header_logo_url, logo_identifier, property_image_url, static_map_*   email presentation
+//   reporting_daily_rate_list, reporting_ancillary_list, reporting_extra_charge_list    internal reporting
+//   total_tokens_earned                                 loyalty accounting
+//   customization (538 lines)                           white-label config; only its id is published
+//   metadata                                            already supplier-only today
+//
+// The nested giants are FLATTENED rather than referenced: PropertyAggregateLightweight is 670 lines and
+// FinancialBreakdown 1,011, and publishing either wholesale would drag their entire transitive shape into
+// a contract we then cannot change. What an agent needs from a property is who and where it is.
+//
+// MONEY CONVENTION, inherited from partner_common.proto: every monetary field is an INTEGER IN MINOR UNITS
+// of the enclosing booking's `currency_code`. There is no decimal on the wire.
+//
+// THE WIRE SAYS `property`, NEVER `hotel`, even though the Java domain and the Mongo field are both
+// `hotel` — see PartnerProtoNamingConventionTest. The mapper is the only place the two vocabularies meet.
+
+// Manage the bookings an agency facilitated — the Travel Agent Booking API.
+//
+// Create bookings on behalf of the agency, then search, inspect, cancel, refund and re-send confirmation
+// for the bookings it produced. Every rpc is scoped to the agency in the `managing-entity-id` call
+// metadata; a booking facilitated by a different agency is not visible here at all.
+//
+// Requires an authenticated token whose account is a TRAVEL_AGENT and holds `BOOKING:READ` (reads) or
+// `BOOKING:WRITE` (create, cancel, refund, resend).
+service Booking {
+
+  // Create a booking on behalf of the agency
+  //
+  // Books inventory against the agency's balance and returns the resulting confirmations. This is the one
+  // rpc that MOVES MONEY on the way in.
+  //
+  // IDEMPOTENT ON `idempotency_key`. gRPC clients retry on UNAVAILABLE by default and a retried create is
+  // a double booking and a double debit, so the key is REQUIRED rather than optional. Replaying a key
+  // returns the ORIGINAL confirmations without booking again. Reuse a key only to retry the same intent —
+  // a new booking needs a new key, and sending a used key with a different payload is FAILED_PRECONDITION
+  // rather than a silent no-op, because the alternative is an agent believing they booked something they
+  // did not.
+  //
+  // A multi-room create produces SEVERAL bookings sharing a `group_id`, which is what makes them
+  // refundable together via RefundBookings.
+  //
+  // Returns INVALID_ARGUMENT when `rooms` is empty, the request is malformed or `idempotency_key` is
+  // blank, FAILED_PRECONDITION
+  // when the key was used for a different request, and PERMISSION_DENIED when the account is not a
+  // travel agent or lacks BOOKING:WRITE.
+  rpc CreateBooking (CreateBookingRequest) returns (CreateBookingResponse) {}
+
+  // Search the agency's bookings
+  //
+  // Every filter is optional and combines with AND. Failed bookings are never returned — that is a server
+  // rule, not a filter you can turn off. Results are scoped to the calling agency automatically.
+  //
+  // Returns INVALID_ARGUMENT when a date is not ISO-8601 or `page.size` exceeds 100.
+  rpc SearchBookings (SearchBookingsRequest) returns (SearchBookingsResponse) {}
+
+  // Get one booking by id
+  //
+  // Returns NOT_FOUND for an unknown id, for a booking belonging to another agency, and for one still
+  // INITIALIZED — an in-flight booking is not yet a fact and is visible only to platform administrators.
+  // All three are deliberately the same answer: distinguishing them would let a caller probe which booking
+  // ids exist.
+  rpc GetBooking (GetBookingRequest) returns (GetBookingResponse) {}
+
+  // Cancel a booking
+  //
+  // Applies the agency's cancellation and returns the booking as it stands afterwards. Whether any money
+  // comes back is decided by the rate's cancellation policy, not by this call — read `refund` on the
+  // response rather than assuming.
+  //
+  // Returns NOT_FOUND for an unknown or other-agency booking, and FAILED_PRECONDITION when the booking is
+  // in a status that cannot be cancelled.
+  rpc CancelBooking (CancelBookingRequest) returns (CancelBookingResponse) {}
+
+  // Re-send the traveller's confirmation email
+  //
+  // Side-effecting but not money-moving, and safe to repeat: the traveller receives another copy. No
+  // idempotency key for that reason.
+  //
+  // Returns NOT_FOUND for an unknown or other-agency booking.
+  rpc ResendConfirmation (ResendConfirmationRequest) returns (ResendConfirmationResponse) {}
+
+  // Immediately refund one booking
+  //
+  // Full refund inside the configured immediate-refund window. MOVES MONEY, so `idempotency_key` is
+  // REQUIRED with the same semantics as CreateBooking — a retried refund is a double refund.
+  //
+  // Returns NOT_FOUND for an unknown or other-agency booking, and FAILED_PRECONDITION when the booking is
+  // outside the immediate-refund window or already refunded.
+  rpc RefundBooking (RefundBookingRequest) returns (RefundBookingResponse) {}
+
+  // Immediately refund every booking in a group
+  //
+  // The group equivalent of RefundBooking. MOVES MONEY; `idempotency_key` is REQUIRED and covers the whole
+  // group, so a retry cannot half-refund it.
+  //
+  // A booking that cannot be refunded does NOT fail the call — it comes back carrying an `error`, the same
+  // judgement GetProperties makes about an unknown id in a batch. One booking outside its window must not
+  // deny the agency the refunds it is owed on the rest.
+  //
+  // Returns NOT_FOUND when the group has no bookings belonging to this agency.
+  rpc RefundBookings (RefundBookingsRequest) returns (RefundBookingsResponse) {}
+}
+
+// ---------------------------------------------------------------------------------------------------
+// The agent's view of a booking
+// ---------------------------------------------------------------------------------------------------
+
+// One booking, as the agency that sold it needs to see it.
+//
+// A deliberate projection, not a mirror of the internal model — see the note at the top of this file for
+// what is excluded and why.
+message AgentBooking {
+
+  // Wink's identifier for this booking.
+  string booking_id = 1;
+
+  // The human-facing reference shown to the traveller, e.g. on the confirmation email.
+  string booking_code = 2;
+
+  // Present when this booking was made as part of a group; RefundBookings operates on this value.
+  string group_id = 3;
+
+  // Where the booking is in its lifecycle.
+  //
+  // LIFECYCLE ONLY — this does NOT report refunds. BOOKING_STATUS_PARTIALLY_REFUNDED and
+  // BOOKING_STATUS_FULLY_REFUNDED are retained for bookings written before the lifecycle and refund
+  // axes were separated, and are never emitted for anything refunded after that. They were always
+  // lossy: a refund settling used to overwrite a cancellation here, so only one of the two facts
+  // survived. Read `refund` (field 14) for whether money came back and how much; a refunded booking
+  // that was not cancelled now correctly reports BOOKING_STATUS_PAYMENT_SUCCEEDED here.
+  BookingStatus status = 4;
+
+  // How the booking came to exist.
+  BookingCreationType creation = 5;
+
+  // When the booking was created. ISO-8601 instant, UTC.
+  string created_at = 6;
+
+  // ISO 4217 currency every monetary field on this message is denominated in. This is the SOURCE currency
+  // — the one the property settles in — which is not necessarily the one the traveller was shown. See the
+  // note on `net_total_sales_amount`.
+  string currency_code = 7;
+
+  // The property and stay.
+  BookedProperty property = 8;
+  BookedStay stay = 9;
+
+  // Who booked it, and who is staying. Frequently the same person, and deliberately still two fields: an
+  // agency books on behalf of a traveller far more often than not.
+  BookingPerson booker = 10;
+  BookingPerson guest = 11;
+
+  // What the agency earns and what the sale was worth.
+  AgentEarnings earnings = 12;
+
+  // Present once cancelled.
+  BookingCancellation cancellation = 13;
+
+  // Present once any refund exists, whether from a cancellation or an immediate refund.
+  BookingRefund refund = 14;
+
+  // Free text captured at booking time.
+  string comment = 15;
+  string special_requests = 16;
+
+  // Charges that apply outside the room rate — early check-in, late check-out and anything the property
+  // adds. `has_additional_charges` is the cheap check; `additional_charges_summary` is the human-readable
+  // detail when it is true.
+  int64 early_check_in_charge = 17;
+  int64 late_check_out_charge = 18;
+  bool has_additional_charges = 19;
+  string additional_charges_summary = 20;
+
+  // How the traveller paid.
+  PaymentType payment_type = 21;
+
+  // The white-label configuration this booking was made through. The id only — the configuration itself is
+  // the agency's own setup and is managed elsewhere, not published here.
+  string customization_id = 22;
+
+  // Status changes in order, oldest first. Enough to answer "when was this cancelled" without a support
+  // ticket.
+  repeated BookingStatusChange status_history = 23;
+}
+
+// Who and where the property is. Flattened from a 670-line aggregate on purpose: an agency servicing a
+// booking needs to identify and contact the property, not to re-render it.
+message BookedProperty {
+
+  string property_id = 1;
+  string name = 2;
+  Address address = 3;
+
+  // Direct contact for the property, for when the agency needs to call about a booking.
+  string phone = 4;
+  string email = 5;
+
+  // IANA zone, e.g. "Asia/Bangkok". Check-in and check-out below are LOCAL to the property, so without
+  // this an agency cannot tell whether a same-day cancellation is still same-day.
+  string time_zone = 6;
+}
+
+// The stay itself.
+message BookedStay {
+
+  // Local dates at the property, ISO-8601 (YYYY-MM-DD).
+  string check_in = 1;
+  string check_out = 2;
+
+  // Nights between them, precomputed so nobody has to reimplement the date arithmetic.
+  int32 nights = 3;
+
+  // What was booked.
+  string room_type_name = 4;
+  string rate_plan_name = 5;
+
+  // How many rooms of the above, and who is in each.
+  int32 quantity = 6;
+  int32 adults = 7;
+
+  // One entry per child, carrying that child's age at check-in. Ages drive pricing, so an empty list means
+  // no children rather than unknown ages.
+  repeated int32 child_ages = 8;
+}
+
+// A person on the booking. Deliberately not the platform's user model: an agency needs to contact somebody
+// about a stay, not to know their account.
+message BookingPerson {
+
+  string first_name = 1;
+  string last_name = 2;
+  string email = 3;
+  string phone = 4;
+}
+
+// What this booking is worth to the agency.
+//
+// The agency's OWN economics only. The platform's fee, the supplier's agency fee and the payment
+// processor's cut are all deliberately absent — they are somebody else's commercial terms and publishing
+// them here would make them a contract we cannot change.
+message AgentEarnings {
+
+  // Net sale value in `currency_code`, summed across SALE-type beneficiaries.
+  //
+  // The SOURCE currency, meaning the one the property settles in. A booking sold in one currency and
+  // settled in another carries an exchange spread, and that spread is intentional platform behaviour — do
+  // not reconcile this against what the traveller was charged and expect equality.
+  int64 net_total_sales_amount = 1;
+
+  // Net amount attributable to the booking after fees, in `currency_code`.
+  int64 net_amount = 2;
+
+  // The agency's commission on this booking, as a percentage at booking time. Percentages rather than
+  // amounts because that is how they are agreed and how they survive a partial refund.
+  string commission_percent = 3;
+
+  // The agency's own agency-fee percentage at booking time.
+  string agency_fee_percent = 4;
+
+  // Commission percentage restated after any refund. Equal to `commission_percent` until something is
+  // refunded, and the value to reconcile against once something is.
+  string commission_percent_after_refund = 5;
+}
+
+// Why and when a booking was cancelled.
+//
+// Field-for-field from the domain's BookingCancellation, minus `cancellerUserIdentifier` (an internal user
+// id an agency cannot resolve) and `groupRefundNotified` (a notification bookkeeping flag).
+message BookingCancellation {
+
+  // ISO-8601 instant, UTC.
+  string cancelled_at = 1;
+
+  // Free text supplied by whoever cancelled.
+  string reason = 2;
+
+  // Who cancelled. An agency cancelling on the traveller's behalf and a property cancelling on the agency
+  // are different conversations.
+  CancellationSource source = 3;
+
+  // The classification the cancellation was filed under, which is not the same thing as `reason`: this is
+  // the closed list the platform reports on, that is what a human typed.
+  CancellationType type = 4;
+}
+
+// Money returned, if any.
+//
+// A cancellation does NOT imply a refund: a non-refundable rate cancels with nothing returned. Read this
+// message rather than inferring from `cancellation`.
+message BookingRefund {
+
+  // Amount returned, in `currency_code` minor units. This is the SOURCE amount — what the property
+  // settles — matching every other monetary field on this message.
+  int64 amount = 1;
+
+  // When the refund was requested, and when it actually settled. `processed_at` is empty while the status
+  // is PENDING or REQUIRES_ACTION, which is the honest answer: it has not been processed yet.
+  string requested_at = 2;
+  string processed_at = 3;
+
+  RefundStatus status = 4;
+
+  // Why it was issued, from the closed list, plus whatever free text accompanied it.
+  RefundReason reason = 5;
+  string description = 6;
+
+  // Processor-hosted receipt for the traveller, when one exists. Published because an agency fielding
+  // "where is my money" needs something to forward; the processor's refund id and fee do not appear here
+  // for the same reason no other payment plumbing does.
+  string receipt_url = 7;
+}
+
+// One lifecycle transition.
+message BookingStatusChange {
+
+  BookingStatus status = 1;
+  string changed_at = 2;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------------------------------
+
+// Where a booking is in its lifecycle.
+//
+// Mirrors the domain enum exactly. `PAYMENT_SUCCEEDED` is the "booked and paid" state — there is no
+// separate CONFIRMED, and no COMPLETED: a stay that has happened is still PAYMENT_SUCCEEDED.
+enum BookingStatus {
+
+  BOOKING_STATUS_UNSPECIFIED = 0;
+
+  // In flight. Never returned by this API — see GetBooking.
+  BOOKING_STATUS_INITIALIZED = 1;
+
+  // Paid against a test payment method. Returned so an agency can tell its own test bookings apart from
+  // real ones rather than discovering the difference in a reconciliation.
+  BOOKING_STATUS_TEST_PAYMENT_SUCCEEDED = 2;
+
+  // Booked and paid. The normal terminal state for a stay that goes ahead.
+  BOOKING_STATUS_PAYMENT_SUCCEEDED = 3;
+
+  BOOKING_STATUS_PAYMENT_FAILED = 4;
+
+  // Never returned: failed bookings are excluded from every response on this service.
+  BOOKING_STATUS_FAILED = 5;
+
+  BOOKING_STATUS_CANCELLED = 6;
+
+  // Refund is NOT a status. A booking can be refunded without having been cancelled and cancelled
+  // without being refunded, so the two cannot share one field — that conflation is what let an async
+  // refund webhook overwrite CANCELLED, and vice versa. Read `refund` for whether money came back.
+  //
+  // 7 and 8 held PARTIALLY_REFUNDED / FULLY_REFUNDED. Removed rather than deprecated because this
+  // service has never been released, so no client can hold the old numbers. Reserved so they cannot
+  // be reused for an unrelated meaning and silently reinterpret an old capture.
+  reserved 7, 8;
+  reserved "BOOKING_STATUS_PARTIALLY_REFUNDED", "BOOKING_STATUS_FULLY_REFUNDED";
+}
+
+// How a booking came to exist.
+//
+// Mirrors the domain enum (`travel.wink.booking.api.BookingCreationType`) name for name, the same
+// convention `PaymentType` below documents. It previously did not: values 1-3 were
+// AGENT/TRAVELLER/CHANNEL_MANAGER, a channel taxonomy that has no domain field behind it. The domain
+// only ever produces NORMAL, TEST or FAILED, so `Enum.valueOf` on the mismatched name threw for every
+// non-FAILED booking, was swallowed, and `creation` silently stayed at its wire default — i.e. every
+// real and test booking published BOOKING_CREATION_TYPE_UNSPECIFIED, unconditionally. Renamed rather
+// than reserved: this service has never been released, so no client can hold the old numbers.
+enum BookingCreationType {
+
+  BOOKING_CREATION_TYPE_UNSPECIFIED = 0;
+  BOOKING_CREATION_TYPE_NORMAL = 1;
+  BOOKING_CREATION_TYPE_TEST = 2;
+
+  // Never returned: failed bookings are excluded from every response on this service.
+  BOOKING_CREATION_TYPE_FAILED = 3;
+}
+
+// How the booking was paid for.
+//
+// Mirrors the domain enum. Two values, not a payment-method taxonomy: either the card was charged through
+// Stripe, or it came off the agency's own balance.
+enum PaymentType {
+
+  PAYMENT_TYPE_UNSPECIFIED = 0;
+  PAYMENT_TYPE_STRIPE = 1;
+  PAYMENT_TYPE_AGENT = 2;
+}
+
+// Who cancelled.
+//
+// Mirrors the domain's BookingCancellerType. Its `HOTEL` member is published as `PROPERTY` — the wire
+// vocabulary is deliberately generic and the naming guard enforces it, so the mapper is where the two
+// spellings meet.
+enum CancellationSource {
+
+  CANCELLATION_SOURCE_UNSPECIFIED = 0;
+  CANCELLATION_SOURCE_PROPERTY = 1;
+  CANCELLATION_SOURCE_GUEST = 2;
+  CANCELLATION_SOURCE_ADMIN = 3;
+  CANCELLATION_SOURCE_AGENT = 4;
+  CANCELLATION_SOURCE_ACQUIRER = 5;
+  CANCELLATION_SOURCE_SALES_CHANNEL = 6;
+  CANCELLATION_SOURCE_SYSTEM = 7;
+}
+
+// Why a booking was cancelled. Mirrors the domain's CancellationType.
+enum CancellationType {
+
+  CANCELLATION_TYPE_UNSPECIFIED = 0;
+  CANCELLATION_TYPE_DUPLICATE = 1;
+  CANCELLATION_TYPE_CANCELLATION = 2;
+  CANCELLATION_TYPE_NO_SHOW = 3;
+  CANCELLATION_TYPE_CC_INVALID = 4;
+  CANCELLATION_TYPE_CC_INSUFFICIENT = 5;
+  CANCELLATION_TYPE_DISCRETIONARY = 6;
+}
+
+// Where a refund has got to. Mirrors the domain's BookingRefundStatus.
+enum RefundStatus {
+
+  REFUND_STATUS_UNSPECIFIED = 0;
+
+  // Requested and settling. NOT a failure, and NOT to be retried — retrying a PENDING refund is how you
+  // refund twice.
+  REFUND_STATUS_PENDING = 1;
+
+  REFUND_STATUS_SUCCEEDED = 2;
+
+  // Spelled with one L, matching the payment processor and the domain enum.
+  REFUND_STATUS_CANCELED = 3;
+
+  // Needs intervention before it can settle; not terminal.
+  REFUND_STATUS_REQUIRES_ACTION = 4;
+
+  REFUND_STATUS_FAILED = 5;
+}
+
+// Why a refund was issued. Mirrors the domain's BookingRefundReason.
+enum RefundReason {
+
+  REFUND_REASON_UNSPECIFIED = 0;
+  REFUND_REASON_DUPLICATE = 1;
+  REFUND_REASON_FRAUDULENT = 2;
+  REFUND_REASON_REQUESTED_BY_CUSTOMER = 3;
+  REFUND_REASON_GUEST_COMPLAINT = 4;
+  REFUND_REASON_GUEST_BOOKED_INCORRECT_DATE = 5;
+  REFUND_REASON_GUEST_SICK = 6;
+  REFUND_REASON_OVERBOOKING = 7;
+  REFUND_REASON_EMERGENCY = 8;
+  REFUND_REASON_FLIGHT_CANCELLED = 9;
+  REFUND_REASON_DEATH_IN_FAMILY = 10;
+  REFUND_REASON_OTHER = 11;
+  REFUND_REASON_EXPIRED_UNCAPTURED_CHARGE = 12;
+  REFUND_REASON_AVAILABILITY_CHECK_FAILED = 13;
+}
+
+// What SearchBookings may sort by.
+//
+// A closed list rather than a free-text field name, so the sortable surface is a contract instead of
+// whatever the storage layer happens to index today. These are exactly the columns the agent booking grid
+// offers.
+enum BookingSortField {
+
+  BOOKING_SORT_FIELD_UNSPECIFIED = 0;
+  BOOKING_SORT_FIELD_CREATED_AT = 1;
+  BOOKING_SORT_FIELD_CHECK_IN = 2;
+  BOOKING_SORT_FIELD_CHECK_OUT = 3;
+  BOOKING_SORT_FIELD_BOOKING_CODE = 4;
+  BOOKING_SORT_FIELD_GUEST_LAST_NAME = 5;
+  BOOKING_SORT_FIELD_GUEST_FIRST_NAME = 6;
+  BOOKING_SORT_FIELD_RATE_PLAN_NAME = 7;
+  BOOKING_SORT_FIELD_PROPERTY_NAME = 8;
+  BOOKING_SORT_FIELD_STATUS = 9;
+}
+
+// SortDirection MOVED to partner_common.proto when partner_account.proto needed the same enum.
+// Both files share the `wink.partner.v1` proto package and the `travel.wink.grpc.v1` java package, so a
+// second declaration was a duplicate-symbol error, not a parallel type. Moving rather than importing
+// partner_booking.proto from partner_account.proto keeps two unrelated surfaces decoupled — and since
+// java_multiple_files = true puts the enum in its own SortDirection.java regardless of which file
+// declares it, neither the wire name (wink.partner.v1.SortDirection) nor any Java import changed.
+
+// ---------------------------------------------------------------------------------------------------
+// Requests and responses
+// ---------------------------------------------------------------------------------------------------
+
+// Request for CreateBooking.
+//
+// Shaped from the domain's CreateAgentBookingRequest rather than from what a single-room booking looks
+// like. `rooms` is REPEATED because the domain takes a list and because that is how a group booking is
+// made — the `group_id` that RefundBookings operates on exists precisely because one create can produce
+// several bookings. A one-room booking is a one-element list.
+message CreateBookingRequest {
+
+  // Idempotency key. REQUIRED — see the rpc comment for why this is not optional on a money-moving call.
+  // Any opaque string up to 128 characters that is unique per booking intent; a UUID is the obvious choice.
+  string idempotency_key = 1;
+
+  // Which of the agency's sites or apps the booking originated on, as an absolute URL.
+  //
+  // REQUIRED, and an explicit field rather than something sniffed from a header. Over REST this was read
+  // off the Origin/Host of the inbound request, which gRPC has no equivalent of — and which quietly
+  // recorded whatever proxy happened to terminate the call. Stating it makes the value mean what it always
+  // claimed to.
+  string booking_origin_url = 2;
+
+  // What to book. At least one room; each entry may name a different property, so a multi-property
+  // itinerary is one call.
+  repeated BookingRoomRequest rooms = 3;
+
+  // ISO 4217 currency to quote totals back in, and ISO 639-1 language for anything human-readable.
+  // BOTH ARE REQUIRED — the domain rejects a blank either way, so omitting one is INVALID_ARGUMENT.
+  //
+  // CAREFUL: this is NOT the same `currency_code` as AgentBooking's, despite the shared name. This one is
+  // what the agency wants to SEE; that one is what the property SETTLES in, and the two differ whenever a
+  // booking is sold in one currency and paid out in another. Every monetary field on the response is in
+  // the settlement currency regardless of what is asked for here — see AgentBooking.currency_code.
+  string currency_code = 4;
+  string language_code = 5;
+
+  // The agency's own correlation id for this attempt, carried into the platform's logs. Distinct from
+  // `idempotency_key`: this one identifies the REQUEST for tracing, that one identifies the INTENT for
+  // deduplication, and reusing a trace id is harmless where reusing a key is not.
+  string trace_id = 6;
+}
+
+// One room to book.
+//
+// Field-for-field from AgentBookingRequest, minus `nights` (derivable from the dates, and a second source
+// of truth for the same fact) and `vendor_specific` (a vendor-keyed metadata map, excluded for the same
+// reason its outbound twin is).
+message BookingRoomRequest {
+
+  // The property to book at. From a Search or Inventory result.
+  string property_id = 1;
+
+  // Local dates at the property, ISO-8601 (YYYY-MM-DD).
+  string check_in = 2;
+  string check_out = 3;
+
+  // The rate to book. From a pricing result's `RoomRate`.
+  string room_rate_id = 4;
+
+  // Which bedroom layout, when the rate offers more than one.
+  string bedroom_configuration_id = 5;
+
+  // Who is in the room, and how many identical rooms of it. Child AGES are required rather than a count:
+  // properties price children in age bands, and an unpriceable age produces a rate that cannot be booked.
+  RoomConfiguration occupancy = 6;
+
+  // Promotional codes to apply. Silently ignored when they do not apply to this rate, which is the same
+  // behaviour the booking engine has.
+  repeated string promotional_codes = 7;
+
+  // Extras to add to this room — spa treatments, restaurant sittings, activities, add-ons, and the
+  // in-room ancillaries sold with the rate itself.
+  repeated BookingAncillaryRequest ancillaries = 8;
+
+  // Free text for the property.
+  string special_requests = 9;
+
+  // Who is staying in this room.
+  BookingPerson guest = 10;
+
+  // The agency's own references, carried onto the booking and echoed back on reporting. These are the
+  // reason an agent booking is its own request type: an agency reconciling Wink against its own system
+  // needs its identifiers to survive the round trip.
+  string external_booking_code = 11;
+  string external_transaction_id = 12;
+  string external_customer_id = 13;
+
+  // Fees the agency is adding on top of the rate. Amounts are in MINOR UNITS of `display_currency`.
+  repeated BookingFee external_fees = 14;
+}
+
+// A fee the agency is adding on top of the rate.
+message BookingFee {
+
+  string fee_id = 1;
+
+  // MINOR UNITS of the enclosing request's `display_currency`.
+  int64 amount = 2;
+
+  string type = 3;
+  string description = 4;
+}
+
+// One extra to add to a room.
+//
+// Every field is quoted back from something the Inventory surface already handed you — there is nothing to
+// construct and nothing to look up. Where you read them from depends on which kind of extra it is:
+//
+//   PROPERTY-LEVEL (restaurant, spa, meeting room, activity, attraction, place, add-on)
+//     inventory_id          AncillaryInventory.inventory_id          — the restaurant or spa itself
+//     channel_inventory_id  AncillaryInventory.channel_inventory_identifier
+//     offer_id              AncillaryOffer.id                        — the sitting, the 1-hour massage
+//     type                  AncillaryInventory.type
+//
+//   IN-ROOM (INVENTORY_SCOPE_ROOM_TYPE_ANCILLARY)
+//     inventory_id          RoomRate.room_rate_id                    — the RATE, not a room type
+//     channel_inventory_id  leave blank — this is the common case and not an error
+//     offer_id              RoomRate.room_type_ancillaries[].id
+//     type                  INVENTORY_SCOPE_ROOM_TYPE_ANCILLARY
+//
+// The in-room case is the one to read twice: its `inventory_id` is a RATE because the gate for these is
+// keyed by the master rate rather than by an entity. Sending a room type id there matches nothing, and it
+// does so SILENTLY rather than failing.
+message BookingAncillaryRequest {
+
+  // The thing being sold from — see the table above. Never a room type.
+  string inventory_id = 1;
+
+  // Your channel's gate onto it. Empty when the item reached you through Wink Network rather than one of
+  // your own sales channels, which is the common case and not an error.
+  string channel_inventory_id = 2;
+
+  // The priced row you are buying.
+  string offer_id = 3;
+
+  // Which kind of extra this is. INVENTORY_SCOPE_ANNOUNCEMENT is informational only and is rejected here.
+  InventoryScope type = 4;
+
+  // How many. Bounded by the offer's `min_pax` and `max_pax` when it sets them; defaults to 1.
+  int32 quantity = 5;
+
+  // OPTIONAL, and only meaningful for appointment-style extras — a spa slot, a restaurant sitting, an
+  // activity departure — or where the offer's `pricing_type` is per hour or per day and the span is what
+  // is being priced.
+  //
+  // In-room extras and add-ons OMIT them: they are bundled with the stay, and sending times makes the
+  // platform treat them as appointments and issue calendar invites nobody asked for.
+  //
+  // These are REQUESTED, never confirmed. The property is not committing to them by accepting the booking.
+  // ISO-8601 local date-time at the property.
+  string requested_start = 6;
+  string requested_end = 7;
+}
+
+// Response for CreateBooking.
+message CreateBookingResponse {
+
+  // One booking per room requested, in the order requested. A multi-room create produces several bookings
+  // sharing a `group_id` — that is what makes them refundable together.
+  //
+  // Repeated rather than singular because the domain returns BookingConfirmations, which is a LIST. A
+  // single-booking response would have quietly dropped every room after the first.
+  repeated AgentBooking bookings = 1;
+
+  // True when this response replayed an earlier call rather than creating anything. Nothing was charged.
+  bool idempotent_replay = 2;
+}
+
+// Request for SearchBookings.
+//
+// Every filter is optional and combines with AND. Failed bookings are excluded server-side and there is
+// deliberately no field to include them.
+//
+// There is also no affiliate filter, and that is a fix rather than an omission: the REST grid offers one
+// while the server independently pins the same field to the calling agency, so any value other than the
+// caller's own produces two contradictory equality filters and a permanently empty page. Scoping belongs
+// to the server.
+message SearchBookingsRequest {
+
+  // When the booking was made.
+  DateRange created = 1;
+
+  // When the stay starts and ends. Both ranges are inclusive.
+  DateRange check_in = 2;
+  DateRange check_out = 3;
+
+  // Exact match on the traveller-facing reference.
+  string booking_code = 4;
+
+  // Exact match, both optional and independent.
+  string guest_first_name = 5;
+  string guest_last_name = 6;
+
+  // Substring match, case-insensitive.
+  string rate_plan_name_contains = 7;
+  string property_name_contains = 8;
+
+  // Exact match on the white-label configuration the booking came through.
+  string customization_id = 9;
+
+  // Restrict to these statuses. Empty means every status except the ones this service never returns.
+  repeated BookingStatus statuses = 10;
+
+  // Zero-based page index and size. Size defaults to 25 and may not exceed 100. Named `page`/`size`
+  // to match every other paginated request on this API, not `page_number`/`page_size`.
+  int32 page = 11;
+  int32 size = 12;
+
+  // Defaults to CREATED_AT descending, which is what the agent grid opens on.
+  BookingSortField sort_by = 13;
+  SortDirection sort_direction = 14;
+}
+
+// An inclusive date range. Either bound may be omitted to leave that side open.
+message DateRange {
+
+  // ISO-8601 (YYYY-MM-DD).
+  string from = 1;
+  string to = 2;
+}
+
+// Response for SearchBookings.
+//
+// Wire mirror of the REST PageResponse envelope: `number` is zero-based and `total_elements` counts across
+// all pages, not this one.
+message SearchBookingsResponse {
+
+  repeated AgentBooking content = 1;
+  int32 number = 2;
+  int32 size = 3;
+  int64 total_elements = 4;
+  int32 total_pages = 5;
+  int32 number_of_elements = 6;
+  bool first = 7;
+  bool last = 8;
+}
+
+// Request for GetBooking.
+message GetBookingRequest {
+
+  string booking_id = 1;
+}
+
+// Response for GetBooking.
+message GetBookingResponse {
+
+  AgentBooking booking = 1;
+}
+
+// Request for CancelBooking.
+message CancelBookingRequest {
+
+  string booking_id = 1;
+
+  // Why the agency is cancelling, as free text. Carried onto the booking and, where the property supports
+  // it, onto the reservation.
+  string reason = 2;
+
+  // The classification to file it under. Defaults to CANCELLATION when unspecified.
+  CancellationType type = 3;
+}
+
+// Response for CancelBooking.
+message CancelBookingResponse {
+
+  // The booking after cancellation. Read its `refund` to find out whether any money came back — a
+  // non-refundable rate cancels with nothing returned.
+  AgentBooking booking = 1;
+}
+
+// Request for ResendConfirmation.
+message ResendConfirmationRequest {
+
+  string booking_id = 1;
+}
+
+// Response for ResendConfirmation.
+//
+// Wrapped rather than returning a bare bool, so this rpc can gain a field later without a wire break.
+message ResendConfirmationResponse {
+
+  // True when the email was handed to the mail pipeline. It does not promise delivery.
+  bool sent = 1;
+}
+
+// Request for RefundBooking.
+message RefundBookingRequest {
+
+  string booking_id = 1;
+
+  // Idempotency key. REQUIRED — a retried refund is a double refund.
+  string idempotency_key = 2;
+
+  // Why the refund is being issued. Recorded against the booking.
+  string reason = 3;
+}
+
+// Response for RefundBooking.
+message RefundBookingResponse {
+
+  // The booking after the refund has been applied. Read `refund.status`: a PENDING refund is settling
+  // normally and must NOT be retried.
+  AgentBooking booking = 1;
+
+  // True when this response replayed an earlier call. Nothing was refunded again.
+  bool idempotent_replay = 2;
+}
+
+// Request for RefundBookings.
+message RefundBookingsRequest {
+
+  // The group to refund, from `AgentBooking.group_id`.
+  string group_id = 1;
+
+  // Idempotency key. REQUIRED, and it covers the WHOLE group so a retry cannot half-refund it.
+  string idempotency_key = 2;
+
+  string reason = 3;
+}
+
+// Response for RefundBookings.
+message RefundBookingsResponse {
+
+  // One entry per booking in the group, including the ones that could not be refunded.
+  repeated RefundOutcome outcomes = 1;
+
+  // True when this response replayed an earlier call. Nothing was refunded again.
+  bool idempotent_replay = 2;
+}
+
+// What happened to one booking in a group refund.
+//
+// A booking that could not be refunded carries `error` and leaves `booking` populated with its unchanged
+// state, rather than failing the call — one booking outside its window must not deny the agency the
+// refunds it is owed on the rest.
+message RefundOutcome {
+
+  // The booking, refunded or not.
+  AgentBooking booking = 1;
+
+  // Empty when the refund succeeded. Human-readable when it did not.
+  string error = 2;
+}

@@ -1,0 +1,435 @@
+// Copyright (c) 2026 Wink.
+syntax = "proto3";
+
+package wink.partner.v1;
+
+import "wink/partner/v1/partner_common.proto";
+
+option java_package = "travel.wink.grpc.v1";
+option java_multiple_files = true;
+option java_outer_classname = "PartnerInventoryProto";
+
+// MAINTAINER NOTES — NOT PUBLISHED.
+//
+// Separated from the next declaration by a BLANK LINE so protoc classifies this as
+// `leading_detached_comments`; GrpcOpenApiGenerator reads only `leading_comments`.
+//
+// Replaced the REST PartnerInventoryController (deleted at the gRPC cutover):
+//   GetPropertyInventory  <- POST /api/partner/{id}/inventory         (HotelInventoryRequest)
+//   ListPropertyInventory <- POST /api/partner/{id}/inventory/list    (HotelInventoryListRequest)
+//   GetRatePeriod         <- POST /api/partner/{id}/inventory/period  (PeriodForPropertyRequest)
+//
+// The billable account arrives as call metadata under `managing-entity-id`, never as a request
+// field — PartnerRequestConventionTest asserts that across every Partner proto. Tags number from 1 with no
+// reservations because nothing has bound yet; once this ships, removed tags MUST be `reserved`.
+//
+// METERED SURFACE, and the meters are NOT the same shape as Search's. All three inventory cost strategies
+// compute units from method ARGUMENTS alone (`actualUnits` just returns `ceilingUnits`), so unlike
+// SearchUsageCostStrategy they do not read the return value and the #709 "annotation drifted off a
+// Page-returning method" failure mode does not apply here. What DOES matter: `@Metered` must stay on
+// the OUTER PartnerInventoryServiceImpl#resolveList, because InventoryListUsageCostStrategy sums the
+// per-entry nights itself. The fan-out inside resolveList calls ConsumablePropertyWithInventoryService
+// directly rather than this.resolveProperty, so INVENTORY_SINGLE cannot fire per entry — do not "tidy" that
+// into a self-call, which would bill every batch twice.
+//
+// ── WHY THIS SURFACE IS PRICES-ONLY ─────────────────────────────────────────────────────────────────
+//
+// The REST twin returns 3,290 lines per property under Views.Non_Authenticated_Entity
+// (PartnerInventoryContractMeasurementTest, 2026-08-08). Measured breakdown:
+//
+//   roomTypes                    1,039  31.6%   pricing and room content mixed together
+//   lowestPrice + cheapestRoomTypes 1,140  34.6%   duplicates of the above, by construction
+//   ancillary static inventory     941  29.0%   restaurants, spas, meeting rooms, activities,
+//                                                attractions, places, recognitions, announcements, reviews
+//   property                          127   3.9%
+//
+// The ancillary 29% is the line that InventoryScope reopens, and it is worth being precise about what
+// changed. What was rejected was returning the ancillaries' STATIC halves — every restaurant's name,
+// gallery and opening hours, on a prices call, in a response nobody could cache. What ships instead is only
+// the priced rows plus `inventory_id`, opt-in per type. The static half is still Content's, still fetched
+// once, still cached against `last_update`. `AncillaryInventory` is six scalars and a list; the REST twin's
+// RestaurantLocalizedInventory embeds a whole RestaurantLightweight.
+//
+// The one deliberate exception is RoomTypeOffers.hero_image_url: one image URL per ROOM TYPE, because
+// a caller rendering an offer needs it and a second call to Content per room is an N+1 nobody should
+// pay for. It is carried once per room rather than per rate -- on a 20-room property with 6 rate x
+// occupancy combinations each, that is 29KB instead of 87KB.
+// So ~63% of the payload is either static content the Content service owns, or a second copy of prices
+// already present elsewhere in the same response. Both were removed for exactly the reasons that shaped
+// partner_search.proto: one source and one version for static content, and never two representations of the
+// same price that can disagree inside a single response.
+//
+// What is left is the thing Inventory has that Search does not: EVERY priced offer for one known property,
+// rather than the best offer per room type.
+//
+// MONEY follows partner_search.proto — int64 minor units, with the currency and its exponent declared once
+// per response. See RoomRate there for the full convention.
+
+// Look up live prices for a property you already know — the paid Partner Inventory API.
+//
+// Search finds properties and returns each one's best offer. Inventory is the next step: given a property,
+// return EVERY priced offer for the requested dates and occupancy, plus a rate calendar for planning across
+// a date range.
+//
+// These endpoints return PRICES, not property content. Names, descriptions, galleries, addresses, amenities
+// and policies come from the Content service — call it once per property, cache the answer, and refresh when
+// `last_update` changes. That keeps these responses small and means property content has exactly one source
+// of truth.
+//
+// That split runs through the transactional inventory too. Ask for `INVENTORY_SCOPE_SPA` and you get the
+// spa's PRICED ROWS keyed by `inventory_id`; the spa's name, photographs and opening hours are the same
+// `inventory_id` in Content. Nothing is returned twice, and the half that changes by the minute is not
+// dragging the half that changes by the month across the wire on every call.
+//
+// Every call needs an authenticated token with `INVENTORY:READ` on the account you name in the
+// `managing-entity-id` metadata header, and is billed in hotel-day units.
+//
+// Prices are live and are not cached. Treat a result as valid for the length of a user's session.
+service Inventory {
+
+  // Prices for one property
+  //
+  // Returns every offer bookable at this property for the requested dates and occupancy, cheapest first.
+  // Identify the property by `property_id` or by `url_name` — set exactly one.
+  //
+  // Billed as min(itinerary nights, 90) hotel-day units, whether or not anything is available.
+  rpc GetPropertyInventory (GetPropertyInventoryRequest) returns (GetPropertyInventoryResponse) {}
+
+  // Prices for several properties
+  //
+  // The same lookup for many properties at once, resolved in parallel. Each entry carries its own dates and
+  // occupancy, so you can price different stays in one call.
+  //
+  // Billed as the SUM over entries of min(that entry's nights, 90) — a batch costs exactly what the same
+  // entries would cost individually, so batching is a latency optimisation rather than a discount.
+  rpc ListPropertyInventory (ListPropertyInventoryRequest) returns (ListPropertyInventoryResponse) {}
+
+  // Rate calendar
+  //
+  // The best available rate for every check-in/check-out combination across a date range — what you need to
+  // render a "cheapest night to stay" calendar without one call per date.
+  //
+  // Billed as `period_in_days` hotel-day units.
+  rpc GetRatePeriod (GetRatePeriodRequest) returns (GetRatePeriodResponse) {}
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Requests
+// ---------------------------------------------------------------------------------------------------
+
+// Request for GetPropertyInventory.
+message GetPropertyInventoryRequest {
+
+  // Traveller context: dates, occupancy, language and currency. Required.
+  UserSession user_session = 1;
+
+  // Which property to price. Set exactly one — `url_name` is accepted so you can price straight from a link
+  // without first resolving it to an id.
+  oneof property {
+
+    // Stable property identifier, as returned by Search and Lookup.
+    string property_id = 2;
+
+    // Url-safe slug, as returned by Search.
+    string url_name = 3;
+  }
+
+  // Transactional inventory to price alongside the room offers. Leave it empty — the default — and you get
+  // room offers only, which is the smallest response and what most booking flows need.
+  //
+  // Each scope you add prices one more class of bookable item. Unrecognised values are ignored rather than
+  // rejected, so a client built against a newer version of this file still works.
+  //
+  // This does NOT change what you are billed: the meter counts hotel-days from the itinerary, not sections
+  // of the response.
+  repeated InventoryScope include = 4;
+
+  // IANA media type for image delivery URLs: image/jpeg (the default), image/png, image/webp, or image/*
+  // to let the CDN negotiate per client from its Accept header. Empty means image/jpeg.
+  //
+  // An unrecognised value is rejected with INVALID_ARGUMENT rather than quietly falling back, so a typo
+  // like "image/jpg" (not a media type) fails loudly instead of serving you JPEG while you believe you
+  // asked for something else. Whatever is served is echoed back on `MediaUrlVariant.format`.
+  string image_format = 5;
+}
+
+
+// Response for GetPropertyInventory.
+message GetPropertyInventoryResponse {
+
+  // The property and its offers.
+  PropertyInventory property = 1;
+
+  // ISO 4217 currency EVERY amount in this response is denominated in.
+  string currency_code = 2;
+
+  // How many decimal places `currency_code` has — amounts are `amount / 10^currency_exponent`.
+  int32 currency_exponent = 3;
+
+  // ISO 639-1 language the names in this response are in.
+  string language_code = 4;
+}
+
+// Request for ListPropertyInventory.
+message ListPropertyInventoryRequest {
+
+  // The properties to price, each with its own dates and occupancy. At least one, at most 20.
+  //
+  // Every entry must ask for the SAME `user_session.currency_code` and `user_session.language_code`, because the
+  // response declares one display currency for all of them. A batch that mixes currencies is rejected with
+  // INVALID_ARGUMENT rather than answered in a currency half the entries did not ask for.
+  repeated GetPropertyInventoryRequest entries = 1;
+}
+
+// Response for ListPropertyInventory.
+message ListPropertyInventoryResponse {
+
+  // One entry per request entry, in the order requested — match results back to your request by position.
+  //
+  // The batch is ATOMIC. If any property cannot be resolved the whole call fails rather than returning a
+  // short or reordered list, because a partial response that still looked well-formed would have you
+  // attribute one property's prices to another. Nothing is billed for a failed batch.
+  repeated PropertyInventory properties = 1;
+
+  // ISO 4217 currency EVERY amount in this response is denominated in.
+  string currency_code = 2;
+
+  // How many decimal places `currency_code` has — amounts are `amount / 10^currency_exponent`.
+  int32 currency_exponent = 3;
+
+  // ISO 639-1 language the names in this response are in.
+  string language_code = 4;
+}
+
+// Request for GetRatePeriod.
+message GetRatePeriodRequest {
+
+  // Tag 7 was `string rate_plan_name_matches`, a caller-supplied regular expression filtering the calendar
+  // to rate plans whose name matched. Removed with the feature: it was the only unbounded-cardinality
+  // component of the calendar's cache key and the only production caller of the platform's
+  // user-supplied-regex machinery. Reserved even though this surface has not shipped, because the field was
+  // published in the generated Partner OpenAPI document. A client that still sets it is ignored, not
+  // rejected — proto3 drops unknown fields.
+  reserved 7;
+  reserved "rate_plan_name_matches";
+
+  // Stable property identifier. Required.
+  string property_id = 1;
+
+  // First check-in date to price, ISO-8601 "YYYY-MM-DD". Required.
+  string start_date = 2;
+
+  // How many days forward to price from `start_date`. Between 2 and 30. Required.
+  //
+  // This is also the billed unit count: a 30-day calendar costs 30 hotel-day units.
+  int32 period_in_days = 3;
+
+  // Adults per room, between 1 and 10. Omit it to take the default of 2.
+  int32 adults = 4;
+
+  // ISO 639-1 language for the room names, e.g. "en". Required: room names are translated against it,
+  // and with no language supplied every name falls back to its untranslated form.
+  string language_code = 5;
+
+  // ISO 4217 currency for the returned prices. Exactly three characters.
+  string currency_code = 6;
+}
+
+// Response for GetRatePeriod.
+message GetRatePeriodResponse {
+
+  // The rate calendar.
+  RatePeriod period = 1;
+
+  // ISO 4217 currency EVERY amount in this response is denominated in.
+  string currency_code = 2;
+
+  // How many decimal places `currency_code` has — amounts are `amount / 10^currency_exponent`.
+  int32 currency_exponent = 3;
+
+  // ISO 639-1 language the names in this response are in.
+  string language_code = 4;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Responses
+// ---------------------------------------------------------------------------------------------------
+
+// One property and every priced offer available for the requested stay.
+//
+// For anything else about the property — name, descriptions, gallery, address, amenities, policies, and its
+// restaurants, spas, meeting rooms and activities — call the Content service with `property_id` and cache the
+// answer against `last_update`.
+message PropertyInventory {
+
+  // Stable property identifier. Your key for everything, including Content lookups.
+  string property_id = 1;
+
+  // Url-safe slug, stable and safe to build links from.
+  string url_name = 2;
+
+  // The property's globally unique short code.
+  string unique_id = 3;
+
+  // When this property's record last changed, ISO-8601 "YYYY-MM-DDThh:mm:ss" in UTC. Use it as the cache key
+  // for your Content responses — the same value Search returns.
+  string last_update = 4;
+
+  // True if AT LEAST ONE offer is bookable for the requested stay. When false, `room_types` still carries
+  // the unavailable offers rather than being empty, so you can show why.
+  bool available = 5;
+
+  // Commission rate your account earns on this property, as a fraction — 0.15 for 15%. A property-channel
+  // term, so it holds for every offer below.
+  double commission = 6;
+
+  // A ready-to-use delivery URL for a single representative image of the PROPERTY (as opposed to
+  // `RoomTypeOffers.hero_image_url`, one per room), scaled to 1024px wide (Cloudinary's medium variant —
+  // c_scale, dpr_auto, f_auto, q_auto:best, w_1024). The lowest-sorted published image; unset when the
+  // property has none.
+  optional string hero_image_url = 12;
+
+  // Offers grouped by room type. `room_types[0].rates[0]` is the best available price, the same figure
+  // Search would have shown for this property.
+  repeated RoomTypeOffers room_types = 7;
+
+  // Every perk referenced by any `RoomRate.perk_ids` below, deduplicated — one entry per distinct perk,
+  // not one per rate. Resolve a perk id here rather than calling Content; a handful of distinct perks
+  // typically cover every rate in this response.
+  repeated PerkContent perks = 8;
+
+  // Every add-on referenced by any `RoomRate.add_on_ids` above, deduplicated the same way perks are.
+  //
+  // Empty unless the request carried `INVENTORY_SCOPE_ADD_ON`. Unlike the collections below, add-ons are
+  // NOT property-scoped: they are matched per room configuration, which is why the association lives on
+  // each rate and only the priced rows are gathered here.
+  repeated AncillaryInventory add_ons = 9;
+
+  // Bookable non-room inventory at this property, one entry per item — a restaurant, a spa, a meeting
+  // room. Each carries only its identifiers and its priced rows; everything describing the item comes
+  // from Content, joined on `inventory_id`.
+  //
+  // Contains only the types you asked for in `include`, and is empty when you asked for none.
+  repeated AncillaryInventory ancillaries = 10;
+
+  // Announcements the property is running for the REQUESTED STAY — already filtered against your
+  // itinerary, so everything here is meant to be shown. Empty unless the request carried
+  // `INVENTORY_SCOPE_ANNOUNCEMENT`.
+  repeated Announcement announcements = 11;
+}
+
+// One non-room item the property sells, and its priced rows.
+//
+// Deliberately thin. `inventory_id` is the SAME identifier Content returns as `InventoryItemContent.id`
+// for this item, so the name, descriptions, gallery, address, amenities and opening hours are one cached
+// Content call away and are never repeated here. What this message adds is the part Content cannot know:
+// what it costs, on your channel, right now.
+message AncillaryInventory {
+
+  // Stable identifier of the item — the restaurant, spa, activity or add-on itself. Join to Content's
+  // `InventoryItemContent.id` for everything descriptive.
+  string inventory_id = 1;
+
+  // Which kind of item this is, so a single flat list can be grouped without inspecting ids.
+  InventoryScope type = 2;
+
+  // Your channel's identifier for carrying this item. Present when the item reached you through a
+  // distribution channel rather than directly.
+  string channel_inventory_identifier = 3;
+
+  // True if this item earns your account commission.
+  bool commissionable = 4;
+
+  // Commission rate on this item, as a fraction — 0.15 for 15%. Zero when `commissionable` is false.
+  double commission = 5;
+
+  // The bookable, priced rows for this item, CHEAPEST FIRST by `unit_price`. An item with no rows at all
+  // is not returned, since it cannot be sold through this surface — Content is where you learn the
+  // property merely HAS a spa.
+  //
+  // Ordered for the same reason room rates are: a caller rendering "from ฿X" takes the first row, and an
+  // arbitrary order would make that figure depend on the property's data-entry sequence.
+  repeated AncillaryOffer offers = 6;
+}
+
+
+// A message the property is running for the dates you asked to be priced.
+//
+// Already resolved against your itinerary: a property's announcements each carry either a date window or
+// an "always show" flag, and both are evaluated server-side. Everything returned here is meant to be
+// displayed, so there is no window and no flag to re-check — publishing them would only invite each
+// integrator to re-implement the filter and get it subtly wrong.
+message Announcement {
+
+  // Stable announcement identifier.
+  string id = 1;
+
+  // Localized title and body together, in English plus your requested language. Whether the title should
+  // be rendered is `show_title`.
+  repeated Description descriptions = 2;
+
+  // True when the property wants the title shown above the body; false to render the body alone.
+  bool show_title = 3;
+}
+
+
+// Best available rate for each check-in date across the requested range.
+message RatePeriod {
+
+  // Stable property identifier.
+  string property_id = 1;
+
+  // The property's name, in the requested language.
+  string name = 2;
+
+  // Adults every rate in this calendar is priced for — the occupancy you asked for, so it is the same for
+  // every entry and is stated once here rather than repeated on each.
+  int32 adults = 3;
+
+  // True if internet is included across the priced rates.
+  bool internet_included = 4;
+
+  // True if parking is included across the priced rates.
+  bool parking_included = 5;
+
+  // One entry per check-in/check-out combination in the range.
+  repeated RatePeriodEntry entries = 6;
+}
+
+// The best available rate for one check-in/check-out combination.
+message RatePeriodEntry {
+
+  // Identifier of the room type this rate is for. Join to Content for its description, images and amenities.
+  string room_type_id = 1;
+
+  // The room type's name, in the requested language.
+  string name = 2;
+
+  // Check-in date, ISO-8601 "YYYY-MM-DD".
+  string start_date = 3;
+
+  // Check-out date, ISO-8601 "YYYY-MM-DD".
+  string end_date = 4;
+
+  // Nights covered.
+  int32 room_nights = 5;
+
+  // True if this combination is bookable.
+  bool available = 6;
+
+  // True if it can be cancelled without charge before the policy's deadline.
+  bool refundable = 7;
+
+  // Days from TODAY until free cancellation closes; -1 when not refundable, 0 when it closes today. Same
+  // calculation as `RoomRate.refundable_until_days`.
+  int32 refundable_until_days = 8;
+
+  // True if breakfast is included.
+  bool breakfast_included = 9;
+
+  // What the guest pays for this combination, in minor units of `currency_code`.
+  //
+  // Only meaningful when `available` is true. An unavailable combination reports 0, which means "no price"
+  // rather than "free" — do not render it as a price.
+  int64 total = 10;
+}

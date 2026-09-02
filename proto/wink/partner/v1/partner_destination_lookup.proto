@@ -1,0 +1,243 @@
+// Copyright (c) 2026 Wink.
+syntax = "proto3";
+
+package wink.partner.v1;
+
+option java_package = "travel.wink.grpc.v1";
+option java_multiple_files = true;
+option java_outer_classname = "PartnerLookupProto";
+
+// MAINTAINER NOTES — NOT PUBLISHED.
+//
+// Everything in this block is separated from the next declaration by a BLANK LINE. protoc
+// classifies such a block as `leading_detached_comments` rather than `leading_comments`, and
+// GrpcOpenApiGenerator only reads the latter, so detached blocks never reach the docs site.
+// That is the mechanism to use for anything a paying integrator should not have to read.
+//
+// Corollary: a comment written DIRECTLY above a service, rpc, message or field IS customer-facing
+// documentation. Write it for an integrator — what the call does and when to reach for it — not
+// for the next engineer. First line becomes the operation summary (the docs sidebar label), so
+// keep it short and imperative; the rest becomes the description.
+//
+// Contract/implementation split: the contract lives here, the implementation lives in
+// partner-grpc. Never implement it in a shared module — all four Spring Boot apps component-scan
+// the whole of `travel.wink`, so a BindableService bean in a shared jar would be silently
+// registered by every app that depends on it.
+//
+// Proto package is `wink.partner.v1`, not the shared `wink.grpc.v1`: it is the first half of every
+// wire path (/{package}.{Service}/{Method}) and this contract versions independently of the
+// cross-surface Diagnostics schema. java_package deliberately stays travel.wink.grpc.v1 — the
+// generated types have no module-layer segment there and are correctly ignored by the ArchUnit
+// family heuristic.
+//
+// Replaced the REST PartnerDestinationLookupController (deleted at the gRPC cutover):
+//   Search <- GET /api/partner/{managingEntityIdentifier}/search?term=
+//   Get    <- GET /api/partner/{managingEntityIdentifier}/lookup/{urlName}?type=
+// Metered PER_CALL under PlatformFeature.PARTNER_API since this stopped being a free surface. Every
+// BUSINESS surface under partner-app carries an SLA, so every one carries a price, and the free TIER
+// (10,000 units/month, SHARED with Inventory, Search and Content) is what makes evaluation free.
+// PartnerGrpcUsageGuard, which enforced the old free surface, was deleted with it.
+//
+// The single unmetered surface is partner_account.proto (`service Accounts`), and it is not a
+// counter-example to the above: it sells nothing, it is the call that tells an integrator which account
+// to bill the rest against, and it is the only one that does not take the `managing-entity-id` header.
+
+// Find the destinations you can query and sell through Wink: properties, cities, countries, islands
+// and attractions.
+//
+// The usual flow is two calls. Use **Search** as your user types to offer suggestions, then take
+// the `urlName` of whichever one they pick and pass it to **Get** to resolve the full record and
+// confirm you are allowed to sell it.
+//
+// Both calls cost ONE unit each, whatever they return — not the per-night pricing that Inventory and Search
+// bill. Driving an autocomplete from Search is therefore cheap, but it is not free: budget a unit per
+// request you send and debounce your input accordingly.
+service Lookup {
+
+  // Search by term
+  //
+  // Typeahead search across destinations. Send the partial text your user has typed and render
+  // the results as suggestions.
+  //
+  // Terms shorter than 3 characters return an empty list rather than an error, so it is safe to
+  // call on every keystroke. At most 50 results are returned, most relevant first.
+  //
+  // Suggestions are not filtered by your sales channel — a property you cannot sell may still
+  // appear here. Get is where that is enforced.
+  rpc Search (SearchRequest) returns (SearchResponse) {}
+
+  // Look up by URL slug
+  //
+  // Resolve one destination from its URL slug and type — for example `bangkok-thailand` plus
+  // DESTINATION_TYPE_CITY. Use it after Search, or whenever you already hold a Wink destination slug in your own
+  // routing.
+  //
+  // Both fields are required, because a slug is only unique within a type.
+  //
+  // Returns NOT_FOUND when nothing matches. For a destination that exists but sits outside your sales
+  // channel it returns PERMISSION_DENIED instead, so you can tell "not yours to sell" apart from
+  // "no such destination".
+  rpc Get (GetRequest) returns (GetResponse) {}
+}
+
+message SearchRequest {
+  // Your Wink account identifier. Every call is scoped to one account, and your token must hold
+  // INVENTORY:READ on it.
+
+  // What the user has typed so far. Fewer than 3 characters (after trimming) returns an empty
+  // list rather than an error.
+  string term = 2;
+}
+
+message SearchResponse {
+  // Matching destinations, most relevant first. At most 50.
+  repeated Destination destinations = 1;
+}
+
+message GetRequest {
+  // Your Wink account identifier. Every call is scoped to one account, and your token must hold
+  // INVENTORY:READ on it.
+
+  // URL slug of the destination, e.g. `bangkok-thailand`. Required.
+  string url_name = 2;
+
+  // Type of the destination you are resolving. Required — a slug is only unique within a type,
+  // so leaving this unset is rejected rather than guessed.
+  DestinationType type = 3;
+}
+
+message GetResponse {
+  // The resolved destination.
+  Destination destination = 1;
+}
+
+// What kind of place a destination is.
+enum DestinationType {
+  // Never sent by the server, and rejected on a request: pick a real type.
+  DESTINATION_TYPE_UNSPECIFIED = 0;
+  DESTINATION_TYPE_CITY = 1;
+  DESTINATION_TYPE_ISLAND = 2;
+  DESTINATION_TYPE_PROPERTY = 3;
+  DESTINATION_TYPE_SPA = 4;
+  DESTINATION_TYPE_MEETING_ROOM = 5;
+  DESTINATION_TYPE_RESTAURANT = 6;
+  DESTINATION_TYPE_ATTRACTION = 7;
+  DESTINATION_TYPE_ACTIVITY = 8;
+  DESTINATION_TYPE_PLACE = 9;
+  DESTINATION_TYPE_COUNTRY = 10;
+}
+
+// A place you can search for and sell through Wink.
+message Destination {
+  // Wink's identifier for this destination entry.
+  string id = 1;
+
+  // What kind of place this is. Determines what `type_identifier` refers to.
+  DestinationType type = 2;
+
+  // Identifier of the underlying resource — a property ID for DESTINATION_TYPE_PROPERTY, a geoname ID for DESTINATION_TYPE_CITY and
+  // DESTINATION_TYPE_COUNTRY. This is the id you pass to the other Wink endpoints that take a property or place.
+  string type_identifier = 3;
+
+  // Display name, in the language given by `language_code`.
+  string name = 4;
+
+  // URL slug. Pass this back to the lookup-by-slug call to resolve this destination later.
+  string url_name = 5;
+
+  // Display name of the supplier that created this entry, where one applies.
+  string owner_name = 6;
+
+  // Nearest city.
+  string city_name = 7;
+
+  string country_name = 8;
+
+  // State or province.
+  string sub_country_name = 9;
+
+  // County or district.
+  string sub_sub_country_name = 10;
+
+  // ISO 3166-1 alpha-2 country code.
+  string country_code = 11;
+
+  // ISO 639-1 code for the language `name` is written in.
+  string language_code = 12;
+
+  // Longitude and latitude in decimal degrees. Both are omitted together when the location is
+  // unknown — which is why they are optional rather than defaulting to 0/0, a real place in the
+  // Gulf of Guinea.
+  optional double longitude = 13;
+  optional double latitude = 14;
+}
+
+// MAINTAINER NOTES — NOT PUBLISHED (detached: note the blank line before the next declaration).
+//
+// THE BILLABLE ACCOUNT IS NOT A REQUEST FIELD. It arrives as call metadata under
+// `managing-entity-id`, and NO Partner request message may declare it — PartnerRequestConventionTest
+// in grpc-proto asserts that absence across every Partner proto file.
+//
+// This is the reverse of the original design, where the account was `managing_entity_identifier` at tag 1
+// and GrpcPartnerCallContextInterceptor resolved it by descriptor name. Three things forced the move:
+//
+//   1. ORDERING. Metadata precedes the payload on the wire, so the interceptor knows the account at call
+//      start. Rate limiting, quota admission and entitlement checks can therefore reject a call without
+//      deserializing its body. Under the field scheme the account did not exist until onMessage, which is
+//      after the handler has already been selected.
+//   2. NO TWO SOURCES OF TRUTH. A field plus a header lets a caller set them to different values and be
+//      billed against one while authorized against the other, silently. A field that does not exist cannot
+//      disagree with the header.
+//   3. IT IS TRANSPORT CONCERN, NOT PAYLOAD. The account scopes the call the way `authorization` does; it
+//      says nothing about what is being asked for. Repeating it in every request message was the protobuf
+//      equivalent of putting the bearer token in the body.
+//
+// Service implementations read it via GrpcPartnerCallContext.requireAccount(), which throws
+// INVALID_ARGUMENT when the header is missing. Tag 1 is now VACANT on these request messages and must stay
+// vacant — reusing it would silently mis-decode any client still built against the old contract.
+//
+// Destination is the view-projected subset of travel.wink.lookup.api.LookupLightweight under
+// Views.Non_Authenticated_Entity. PartnerDestinationLookupTransportParityTest enforces
+// field-for-field parity with the trimmed REST contract.
+//
+// owner_name MUST NEVER BECOME EXPANDABLE, and the owner's identifier/type must never be added:
+// they are @JsonView(Views.ManagingEntity) on LookupLightweight and were deliberately trimmed off
+// the partner wire. Re-adding them would leak supplier identity the trim exists to withhold.
+//
+// GetResponse wraps Destination rather than returning it bare because an rpc response type is
+// permanent; the wrapper leaves room for siblings without a wire break.
+//
+// type_identifier is deliberately a plain string, not an expandable wrapper — a Destination is
+// already the cheap denormalised lookup row, so there is no second read for expansion to defer.
+
+// ===========================================================================================
+// EXPANSION CONVENTION (Stripe-style `expand`) — NOT USED BY THIS FILE
+// ===========================================================================================
+//
+// Nothing in this schema is expandable, and that is the right call: a Destination is already
+// the cheap denormalised lookup row. Every field it carries is one Atlas Search hit away, so
+// there is no second datastore read for `expand` to defer — it would add a oneof to unpack and
+// a request field that can only ever error.
+//
+// The pattern pays off where a response embeds a relation that is EXPENSIVE TO MATERIALISE and
+// NOT ALWAYS WANTED. When such an endpoint is migrated:
+//
+//   1. Publish the relation as `ExpandableFoo { oneof value { string id = 1; Foo expanded = 2; } }`
+//      BEFORE any integrator binds. Turning a published `string foo = N;` into a message field
+//      later is a breaking wire change (both encode as wire type 2, so old clients decode the
+//      nested bytes as a corrupt string rather than failing loudly). Adding an arm to an
+//      EXISTING oneof is additive and safe.
+//   2. Add `repeated string expand = N;` to the request, and reject unknown paths with
+//      INVALID_ARGUMENT rather than ignoring them — a dropped expansion is indistinguishable on
+//      the wire from an empty relation, so a typo becomes a support ticket instead of an error.
+//   3. One wrapper message per relation, never a shared `ExpandableRef`: a shared one
+//      accumulates an arm for every expandable type API-wide, so clients switch over arms that
+//      cannot appear on the message they hold.
+//   4. Never expand a relation whose identifier was deliberately withheld from the contract
+//      (see `owner_name` above).
+//
+// NOTE ON MOTIVATION: this is not about payload size. An unset proto3 message field costs zero
+// bytes, so a collapsed response is already minimal. `expand` exists to make the caller ask for
+// extra SERVER WORK — the datastore reads and view projection behind the relation — and to save
+// a round trip when they do want it.
+// ===========================================================================================

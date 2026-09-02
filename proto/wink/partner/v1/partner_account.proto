@@ -1,0 +1,428 @@
+// Copyright (c) 2026 Wink.
+syntax = "proto3";
+
+package wink.partner.v1;
+
+import "wink/partner/v1/partner_common.proto";
+
+option java_package = "travel.wink.grpc.v1";
+option java_multiple_files = true;
+option java_outer_classname = "PartnerAccountProto";
+
+// MAINTAINER NOTES — NOT PUBLISHED.
+//
+// Separated from the next declaration by a BLANK LINE so protoc classifies this as
+// `leading_detached_comments`; GrpcOpenApiGenerator reads only `leading_comments`. Anything written
+// DIRECTLY above a service, rpc, message or field IS customer-facing documentation.
+//
+// PORTED FROM (the REST endpoints REMAIN — this surface is additive, not a cutover):
+//   ListAccounts   <- GET  /api/managing-entity/list/all
+//   SearchAccounts <- POST /api/managing-entity/grid          (was `hidden = true`)
+//   GetAccount     <- GET  /api/managing-entity/{managingEntityIdentifier}
+//
+// THIS IS THE ONE FREE SURFACE UNDER partner-app, and the exception is deliberate.
+//
+// Every other partner RPC is `@Metered` and requires the `managing-entity-id` metadata header,
+// because the header names the account the call is BILLED to. These three are the calls an
+// integrator makes to LEARN what belongs in that header, so requiring it would be circular.
+//
+// The consequence had to be designed around rather than inherited: ApiUsageMeteringAspect reads
+// `PartnerCallContext.account()` and, when it is blank, returns `pjp.proceed()` — it SILENTLY skips
+// metering. An `@Metered` RPC that does not require the header would therefore run, return data and
+// bill nothing, with no error anywhere. So these RPCs carry no `@Metered` annotation at all: the
+// absence is explicit and readable, rather than an annotation that quietly never fires.
+//
+// They are NOT unprotected. GrpcRateLimitServerInterceptor keys on the JWT principal and never
+// inspects the request message or the account, so it applies here unchanged. Free means unbilled,
+// not unbounded.
+//
+// FIELD SELECTION IS A SECURITY BOUNDARY, NOT A CONVENIENCE. `ManagingEntityLightweight` — what the
+// REST endpoints serialize — carries `bankAccounts`, `revolutPayoutAccounts`, `managers`,
+// `accountEmail` and `accountPhoneNumber`. Those are gated by `@JsonView(Views.Authenticated_Entity)`,
+// which on that DTO gates nothing: every field except `metadata` carries the same view, so the REST
+// response ships payout destinations and the full team roster wholesale.
+//
+// gRPC has no view mechanism, so `Account` below IS the allow-list, permanently. The five fields
+// above are ABSENT ON PURPOSE and must stay absent — this is a paid third-party surface, and an
+// integrator who can see which accounts they may act for has no reason to receive the bank details
+// attached to them. AccountProtoMapperTest asserts their absence directly; that test is the guard,
+// so do not weaken it into a happy-path mapping check.
+//
+// TWO IDENTIFIERS, RENAMED BECAUSE THE DOMAIN NAMES ARE AMBIGUOUS. `Account.owner_user_id` is the
+// DTO's `userIdentifier` (the human who owns the account) and `Account.provisioned_by_id` is its
+// `ownerIdentifier` (the application that created the record, typically Wink). Read in the domain's
+// vocabulary those two read as near-synonyms and get transposed; nothing was dropped in the rename.
+//
+// THE SERVICE IS PLURAL (`Accounts`) AND THE MESSAGE IS SINGULAR (`Account`) — this is not a style
+// choice. Protobuf puts services and messages in ONE namespace, so `service Account` alongside
+// `message Account` is a duplicate-symbol error ("Account is already defined in wink.partner.v1").
+// The other services here are singular (Content, Booking, Search, Lookup, Inventory) only because none
+// of them names its payload after itself. Renaming the MESSAGE instead was the alternative and was
+// rejected: `Account` is what the thing is, and every other name for it (AccountSummary, AccountView)
+// implies a fuller variant that does not exist.
+//
+// `HOTEL` -> ACCOUNT_TYPE_PROPERTY on the wire, matching DESTINATION_TYPE_PROPERTY in
+// partner_destination_lookup.proto: the wire vocabulary is deliberately generic because the platform
+// is taking on vacation rentals that are not hotels. Both enums below were enumerated against the
+// domain (`ManagingEntityType`, `ManagingEntityStatus`, `ManagingEntityOwnerType`) rather than
+// guessed — TRIP_PAY and TRAVELIKO are internal and have no wire constant.
+//
+// SearchAccountsRequest is TYPED, and deliberately does not publish `State`. The REST twin accepts
+// Kendo's State (skip/take/sort/recursive CompositeFilterDescriptor/group), which is an internal UI
+// grid contract; publishing it on a paid API would freeze it. The mapper assembles a State from
+// these typed fields instead. `name_query` is regex-ESCAPED before it reaches Mongo — see
+// AccountProtoMapper#toState — because StateMongoQueryHelper's `contains` operator compiles the raw
+// value as a case-insensitive regex.
+//
+// NO ADMIN BYPASS. The REST grid endpoint branches on `isAdmin(principal)` and returns every
+// managing entity on the platform. SearchAccounts has no such branch: a platform admin over gRPC
+// sees exactly what they can access, same as anyone else. Do not add it back — an
+// everything-on-the-platform branch reachable from a paid external surface is a large blast radius
+// for one token-scope mistake, and no other partner RPC has one.
+
+// Find out which Wink accounts you may act for.
+//
+// Every other call on this API is scoped to one account: you send its identifier in the
+// `managing-entity-id` metadata header, and your token must hold a permission on it. This service is
+// where that identifier comes from.
+//
+// Start with **ListAccounts** to see everything your token reaches, then use the `account_id` of
+// whichever one you want on your subsequent Inventory, Search, Content and Booking calls. Reach for
+// **SearchAccounts** instead when you manage enough accounts to need paging or filtering, and
+// **GetAccount** when you already hold an identifier and want the current record.
+//
+// These three calls are FREE. They are not metered and they consume none of your monthly units, so
+// you can call them at start-up without budgeting for them. Ordinary rate limits still apply.
+//
+// Unlike the rest of this API, these calls do NOT require the `managing-entity-id` header — they are
+// what tells you which value to send.
+service Accounts {
+
+  // List the accounts you can act for
+  //
+  // Returns every account you can actually operate on — you are its owner, or your membership has been
+  // accepted. This is the normal starting point for an integration: call it once at start-up, keep the
+  // `account_id` values you care about, and send them as the `managing-entity-id` header on your other
+  // calls. Every identifier returned here is one your token can genuinely use.
+  //
+  // An account you have merely been INVITED to and have not accepted does not appear, and neither does
+  // a removed one. Both would otherwise be handed to you here and then rejected with PERMISSION_DENIED
+  // by every call you made with them.
+  //
+  // The response is scoped entirely by your token; there is nothing to pass. An empty list means your
+  // token reaches no account yet, not that something went wrong.
+  //
+  // At most 200 accounts come back. If you hold more, `truncated` is true and you should switch to
+  // SearchAccounts, which pages. The list is never silently cut off without that flag being set.
+  //
+  // Free: this call is not metered.
+  rpc ListAccounts (ListAccountsRequest) returns (ListAccountsResponse) {}
+
+  // Search the accounts you can act for
+  //
+  // The paged, filterable form of ListAccounts, over exactly the same set of accounts, for when you
+  // hold too many to take in one response. Filter by lifecycle status, by account type, or by the
+  // start of the name, and page with `skip` and `take`.
+  //
+  // Every filter is optional; sending none is the same as ListAccounts with paging. Results are
+  // scoped to the accounts your token can reach — being a platform administrator does not widen it.
+  //
+  // Free: this call is not metered.
+  rpc SearchAccounts (SearchAccountsRequest) returns (SearchAccountsResponse) {}
+
+  // Get one account by id
+  //
+  // Retrieve the current record for a single account you already hold the identifier for — after a
+  // rename, say, or to refresh a copy you cached at start-up.
+  //
+  // Requires an authenticated token with `ACCOUNT:READ` on the account you ask for. Returns
+  // PERMISSION_DENIED when your token cannot reach it and NOT_FOUND when no such account exists, so
+  // you can tell a revoked grant apart from a stale identifier.
+  //
+  // Free: this call is not metered.
+  rpc GetAccount (GetAccountRequest) returns (GetAccountResponse) {}
+}
+
+// Request for ListAccounts.
+//
+// Which accounts come back is scoped by your token alone; there is nothing to filter on. The only field
+// here shapes how the accounts' logos are DELIVERED, not which ones you get.
+message ListAccountsRequest {
+
+  // IANA media type for image delivery URLs: image/jpeg (the default), image/png, image/webp, or image/*
+  // to let the CDN negotiate per client from its Accept header. Empty means image/jpeg.
+  //
+  // An unrecognised value is rejected with INVALID_ARGUMENT rather than quietly falling back, so a typo
+  // like "image/jpg" (not a media type) fails loudly instead of serving you JPEG while you believe you
+  // asked for something else. Whatever is served is echoed back on `MediaUrlVariant.format`.
+  string image_format = 1;
+}
+
+message ListAccountsResponse {
+
+  // The accounts you can act for, up to 200. May be empty.
+  repeated Account accounts = 1;
+
+  // True when you hold more than the 200 returned, so this list is incomplete. Switch to
+  // SearchAccounts, which pages. It is false in every ordinary case; the list is never shortened
+  // without setting it.
+  bool truncated = 2;
+}
+
+message SearchAccountsRequest {
+
+  // How many records to skip. Omit it to start at the beginning.
+  //
+  // Paging is page-aligned, so this must be a whole multiple of `take` — 0, then `take`, then
+  // `2 * take`, and so on. A partial offset is rejected with INVALID_ARGUMENT rather than quietly
+  // rounded down, so you can never be handed a page you did not ask for.
+  int32 skip = 1;
+
+  // How many records to return. Between 1 and 180; omit it to take the default of 30.
+  int32 take = 2;
+
+  // Return only accounts with this lifecycle status. Omit it to return every status.
+  AccountStatus status = 3;
+
+  // Return only accounts of this type. Omit it to return every type.
+  AccountType type = 4;
+
+  // Return only accounts whose name STARTS WITH this text, case-insensitively. Matched literally —
+  // regular-expression characters carry no special meaning. At most 100 characters.
+  //
+  // Prefix rather than substring on purpose: a substring match cannot use the name index and so reads
+  // every account on the platform on a call that costs you nothing, which is not a load we are willing
+  // to publish. Search for "Siam" to find "Siam Residences", not for "Residences".
+  string name_query = 5;
+
+  // Field to sort on. One of `name`, `urlName`, `status`, `type`, `createdDate` or `lastUpdate`;
+  // anything else is rejected. Omit it to sort by `name`.
+  string sort_by = 6;
+
+  // Direction for `sort_by`. Omit it to sort ascending. Declared in partner_common.proto and shared
+  // with the Booking surface, so ordering reads the same wherever you page.
+  SortDirection sort_direction = 7;
+
+  // IANA media type for image delivery URLs: image/jpeg (the default), image/png, image/webp, or image/*
+  // to let the CDN negotiate per client from its Accept header. Empty means image/jpeg.
+  //
+  // An unrecognised value is rejected with INVALID_ARGUMENT rather than quietly falling back, so a typo
+  // like "image/jpg" (not a media type) fails loudly instead of serving you JPEG while you believe you
+  // asked for something else. Whatever is served is echoed back on `MediaUrlVariant.format`.
+  string image_format = 8;
+}
+
+message SearchAccountsResponse {
+
+  // The matching accounts for this page.
+  repeated Account accounts = 1;
+
+  // Records skipped to produce this page — echoes the `skip` you sent.
+  int32 skip = 2;
+
+  // Page size used — echoes the `take` you sent, or the default that was applied.
+  int32 take = 3;
+
+  // Total accounts matching the filters, across all pages.
+  int64 total_count = 4;
+}
+
+message GetAccountRequest {
+
+  // Identifier of the account to retrieve. Required. Your token must hold `ACCOUNT:READ` on it.
+  string account_id = 1;
+
+  // IANA media type for image delivery URLs: image/jpeg (the default), image/png, image/webp, or image/*
+  // to let the CDN negotiate per client from its Accept header. Empty means image/jpeg.
+  //
+  // An unrecognised value is rejected with INVALID_ARGUMENT rather than quietly falling back, so a typo
+  // like "image/jpg" (not a media type) fails loudly instead of serving you JPEG while you believe you
+  // asked for something else. Whatever is served is echoed back on `MediaUrlVariant.format`.
+  string image_format = 2;
+}
+
+message GetAccountResponse {
+
+  // The account matching `account_id`.
+  Account account = 1;
+}
+
+// One Wink account — the business entity that owns properties, receives payouts and controls team
+// access.
+//
+// This is an identity projection: enough to recognise an account, route a call to it and render it in
+// a picker. It deliberately carries no banking, payout or team-roster detail.
+message Account {
+
+  // Stable identifier for this account. Send it as the `managing-entity-id` metadata header on every
+  // other call in this API.
+  string account_id = 1;
+
+  // Identifier of the user who owns this account.
+  string owner_user_id = 2;
+
+  // Identifier of the application that provisioned this account — normally Wink itself.
+  string provisioned_by_id = 3;
+
+  // Whether the account is held by a company or by an individual.
+  AccountOwnerType owner_type = 4;
+
+  // What kind of business this account is.
+  AccountType type = 5;
+
+  // Display name.
+  string name = 6;
+
+  // Registered legal name, when it differs from the display name.
+  string legal_name = 7;
+
+  // URL-friendly slug identifying the account in public profiles and links, e.g.
+  // `the-siam-residences-bangkok`.
+  string url_name = 8;
+
+  // Short human-friendly identifier, used where a UUID would be unwieldy.
+  string unique_id = 9;
+
+  // Where the account sits in its lifecycle. Only ACCOUNT_STATUS_ACTIVE accounts transact.
+  AccountStatus status = 10;
+
+  // ISO 4217 currency the account accounts and settles in, e.g. "THB".
+  string currency_code = 11;
+
+  // Short description of the business.
+  string description = 12;
+
+  // Primary website or social URL.
+  string url = 13;
+
+  // Business address.
+  Address address = 14;
+
+  // City the account is registered in.
+  AccountCity city = 15;
+
+  // The account's logo, when it has published one.
+  Multimedia logo = 16;
+}
+
+// The city an account is registered in.
+//
+// A projection of Wink's geographic record, not a free-text city name — `url_name` is the same slug
+// the destination Lookup service accepts, so you can resolve the full destination from it.
+message AccountCity {
+
+  // Wink's identifier for this city.
+  string geo_name_id = 1;
+
+  // City name.
+  string name = 2;
+
+  // URL slug, e.g. `bangkok-thailand`. Accepted by Lookup's Get with DESTINATION_TYPE_CITY.
+  string url_name = 3;
+
+  // ISO 3166-1 alpha-2 country code, e.g. "TH".
+  string country_code = 4;
+}
+
+// Whether an account is held by a company or an individual.
+enum AccountOwnerType {
+
+  // Never sent by the server.
+  ACCOUNT_OWNER_TYPE_UNSPECIFIED = 0;
+
+  // A corporate entity.
+  ACCOUNT_OWNER_TYPE_COMPANY = 1;
+
+  // A sole proprietor.
+  ACCOUNT_OWNER_TYPE_INDIVIDUAL = 2;
+}
+
+// What kind of business an account is.
+enum AccountType {
+
+  // The account's type is not one this API publishes. Sent rather than omitting the account, so a
+  // new internal type can never make an account you manage disappear from your list.
+  ACCOUNT_TYPE_UNSPECIFIED = 0;
+
+  // A hotel, resort, vacation rental or other bookable property.
+  ACCOUNT_TYPE_PROPERTY = 1;
+
+  // A software application integrating with Wink.
+  ACCOUNT_TYPE_APPLICATION = 2;
+
+  // A travel agency.
+  ACCOUNT_TYPE_TRAVEL_AGENT = 3;
+
+  // A corporate travel buyer.
+  ACCOUNT_TYPE_CORPORATE = 4;
+
+  // A content creator monetising travel recommendations.
+  ACCOUNT_TYPE_INFLUENCER = 5;
+
+  // A travel blogger.
+  ACCOUNT_TYPE_BLOGGER = 6;
+
+  // A destination marketing organisation.
+  ACCOUNT_TYPE_DESTINATION = 7;
+
+  // A channel manager distributing inventory on behalf of properties.
+  ACCOUNT_TYPE_CHANNEL_MANAGER = 8;
+
+  // A property management system.
+  ACCOUNT_TYPE_PROPERTY_MANAGEMENT_SYSTEM = 9;
+
+  // A central reservation system.
+  ACCOUNT_TYPE_CENTRAL_RESERVATION_SYSTEM = 10;
+
+  // A Google Hotel API integration.
+  ACCOUNT_TYPE_GOOGLE_HOTEL_API = 11;
+
+  // A company managing properties on their owners' behalf.
+  ACCOUNT_TYPE_MANAGEMENT_COMPANY = 12;
+
+  // A hotel chain.
+  ACCOUNT_TYPE_CHAIN = 13;
+
+  // A hotel brand.
+  ACCOUNT_TYPE_BRAND = 14;
+
+  // An event organiser.
+  ACCOUNT_TYPE_EVENT_ORGANIZER = 15;
+
+  // A payment facilitator.
+  ACCOUNT_TYPE_FACILITATOR = 16;
+
+  // A direct-booking account.
+  ACCOUNT_TYPE_DIRECT = 17;
+
+  // Anything that fits none of the above.
+  ACCOUNT_TYPE_OTHER = 18;
+}
+
+// Where an account sits in its lifecycle.
+enum AccountStatus {
+
+  // Never sent by the server, and ignored on a request: omit the field instead of setting this.
+  ACCOUNT_STATUS_UNSPECIFIED = 0;
+
+  // Created and awaiting compliance review; cannot transact yet.
+  ACCOUNT_STATUS_PENDING_APPROVAL = 1;
+
+  // Fully onboarded and operating. The only status that transacts.
+  ACCOUNT_STATUS_ACTIVE = 2;
+
+  // Deactivated; no longer visible or transacting.
+  ACCOUNT_STATUS_INACTIVE = 3;
+
+  // Under compliance or quality review; some operations may be limited.
+  ACCOUNT_STATUS_UNDER_REVIEW = 4;
+
+  // Temporarily suspended for policy violations or abuse.
+  ACCOUNT_STATUS_SUSPENDED = 5;
+
+  // Onboarding was rejected.
+  ACCOUNT_STATUS_REJECTED = 6;
+
+  // Permanently removed from the platform.
+  ACCOUNT_STATUS_REMOVED = 7;
+}

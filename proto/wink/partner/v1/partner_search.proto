@@ -1,0 +1,961 @@
+// Copyright (c) 2026 Wink.
+syntax = "proto3";
+
+package wink.partner.v1;
+
+import "wink/partner/v1/partner_common.proto";
+
+option java_package = "travel.wink.grpc.v1";
+option java_multiple_files = true;
+option java_outer_classname = "PartnerSearchProto";
+
+// MAINTAINER NOTES — NOT PUBLISHED.
+//
+// Separated from the next declaration by a BLANK LINE so protoc classifies this as
+// `leading_detached_comments`; GrpcOpenApiGenerator reads only `leading_comments`.
+//
+// Replaced the REST PartnerInventorySearchController (deleted at the gRPC cutover):
+//   SearchByGeo    <- POST /api/partner/{id}/search/geo            (MapRequest)
+//   SearchByCity   <- POST /api/partner/{id}/search/city           (CitySearchRequest)
+//   RankByAgency   <- POST /api/partner/{id}/ranked/search/agency  (AgencyScoreRequest)
+//   RankByCity     <- POST /api/partner/{id}/ranked/search/city    (CityScoreRequest)
+//   RankByCountry  <- POST /api/partner/{id}/ranked/search/country (CountryScoreRequest)
+//   RankGlobal     <- POST /api/partner/{id}/ranked/search/global  (GlobalScoreRequest)
+//
+// The billable account is NOT a request field — it arrives as call metadata under
+// `managing-entity-id` and is read via GrpcPartnerCallContext.requireAccount(). No Partner request
+// message may declare it; PartnerRequestConventionTest asserts that absence. See the maintainer notes in
+// partner_destination_lookup.proto for why the account moved off the payload.
+//
+// TAG NUMBERING. Nothing consumes this contract yet — not production, which still serves the pre-gRPC
+// servlet app, and not staging either: it runs the gRPC service, but nothing outside this repo has a
+// generated client pointed at it. So a removed field's tag is reused directly rather than left `reserved`
+// -- there is no existing decoder anywhere that a recycled tag could feed garbage to. This is a standing
+// policy, not a one-off judgement call: it holds for every edit on this surface until something outside
+// this repo actually depends on it, at which point `reserved` becomes mandatory and this note should say
+// so.
+//
+// SearchRoomRate's `reserved 19, 27` is the one exception, and it is NOT this policy: it exists to keep
+// SearchRoomRate diffable against the sibling RoomRate message, which still legitimately uses those tags
+// for different fields (see SearchRoomRateParityTest and the note on SearchRoomRate itself), not because
+// any external decoder depends on it.
+//
+// METERED SURFACE. Do NOT call PartnerGrpcUsageGuard from PartnerSearchGrpcService — that guard is
+// free-surface-only. Billing happens because PartnerSearchServiceImpl's six methods carry
+// `@Metered(MeterStrategy.SEARCH)`; that annotation MUST stay on a Page-returning method or the cost
+// silently collapses to the one-unit floor (the #709 regression).
+//
+// WHY `SearchByCityRequest.city` AND `RankByCityRequest.city` ARE ONEOFS, NOT ONE STRING. City search
+// used to take a bare identifier and match it `$or: [{cityGeoNameId: X}, {cityUrlName: X}]`. Measured on
+// production, that degraded into a post-FETCH residual filter — an `$or` can only use an index on every
+// branch, so the most selective predicate in the whole query (roughly 1/634 of the collection) stopped
+// being one, and ~90% of the documents pulled off disk were discarded. `travel.wink.inventory.api.CityKey`
+// exists to make that mistake structurally impossible: the caller states which form it holds, and exactly
+// one indexed match runs. The oneof here is that same discipline reaching the wire — see
+// PartnerSearchProtoMapper.toCitySearchRequest and toCityScoreRequest for where a request becomes a
+// CityKey, and `travel.wink.computed.api.property.CitySearchRequest`/`CityScoreRequest` (the shared
+// REST/domain request types) for why THEY stay permissive: those are also a published REST request body
+// with real callers, so they accept both fields and resolve a precedence rather than rejecting a caller
+// who defensively sends both. The gRPC surface has no such history, so it enforces exactly-one
+// structurally instead.
+//
+// ── THE DESIGN DECISION THIS FILE ENCODES ───────────────────────────────────────────────────────────
+//
+// A pricing endpoint returns PRICES. Static content — property descriptions, addresses, galleries, room
+// detail, amenities, policies, rate plan and perk prose — is served exclusively by `service Content` and
+// appears NOWHERE on this surface.
+//
+// There is deliberately NO opt-in to inline static content. An `expand`-style mechanism was designed for
+// the Partner API in #668 and is NOT revived here, because two sources for the same static data means two
+// versions that can disagree within a single response. One source, one version. That is the whole point.
+//
+// `last_update` on every result is what makes the split workable. Cache Content keyed on property_id, compare
+// the timestamp on each search, re-fetch only when it moves. Without it a thin row would force either
+// constant re-fetching or stale names. It is the aggregate's own lastUpdate rather than a synthetic
+// opaque token: same job, and an integrator can also show "updated 3 days ago" with it.
+//
+// Rate-attached data splits on DECISION vs PROSE. Fields that change which offer a traveller would pick
+// stay inline — meal-inclusion booleans, `refundable`, the money. The localized names and descriptions
+// behind them move to Content, reachable through the identifiers carried here (`room_rate_id`,
+// `perk_ids`, `cancellation_policy_id`). You can rank and choose without a second call; you need Content
+// only to render prose.
+//
+// `rate_plan_id`, `room_type_id` and `channel_inventory_id` were dropped, and RoomPrice was folded into
+// RoomRate. The rate plan is an embedded object on the master rate, so `room_rate_id` already reaches it;
+// the wrapper message added a level of nesting that carried one identifier and nothing else.
+//
+// That split is also why no monetary perk value is published. The domain's `perkValue` is a sum of
+// internal tier levels, not an amount, and dressing it up as money on a paid wire would have integrators
+// adding it to totals. The perk-ranked sort went with it — see ScoreSort.
+//
+// Measured baseline for reference: the REST twin serializes ~1,186 lines per result under
+// Views.Non_Authenticated_Entity (PartnerSearchContractMeasurementTest, 2026-08-07). Everything removed here
+// is retrievable from Content, so nothing is lost — only relocated.
+//
+// MONEY is minor-unit int64 plus a page-level currency and exponent, NOT google.type.Money. Money would
+// repeat currency_code on four fields per offer on every result -- pure redundancy once the page declares
+// one display currency. What must NOT be lost in that trade is the EXPONENT: NumberUtils lists JPY/KRW/VND/
+// CLP/ISK among this platform's currencies, so a fixed divide-by-100 is wrong for real inventory. Publish
+// currency_exponent; never assume 2.
+
+// Search Wink's bookable property inventory and get live prices — the paid Partner Search API.
+//
+// Six ways to find properties: by map position, by city, or ranked by agency, city, country or globally.
+// All six return the same page shape, so one result renderer serves every entry point.
+//
+// These endpoints return PRICES, not property content. Each result carries just enough to render a list row
+// — name, location, star rating, one image — plus the prices themselves. Descriptions, galleries, addresses,
+// room detail, amenities and policies come from the Content service, which you should cache per property and
+// refresh when `last_update` changes. That split keeps search responses small and fast, and it means
+// property content has exactly one source of truth.
+//
+// Every call needs an authenticated token with `INVENTORY:READ` on the account you pass, and is billed in
+// hotel-day units: (properties actually returned) x min(itinerary nights, 90). You are charged for what comes
+// back, not for what you asked for — a request for 50 results that matches 3 properties bills 3 properties.
+//
+// Prices are live and are not cached. Treat a result as valid for the length of a user's session.
+service Search {
+
+  // Search by map position
+  //
+  // Find properties inside a search area. Set `area` to a point for "near here", a polygon for "everything
+  // in this viewport", or a multi-polygon for several disjoint regions at once.
+  //
+  // A point search is ordered nearest first and reports `distance_in_meters` on every result. Polygon and
+  // multi-polygon searches are containment tests with no distance and no distance ordering.
+  //
+  // Returns INVALID_ARGUMENT if `area` is unset, if its geometry is malformed, or if you pass
+  // `radius_in_meters` with anything other than a point.
+  rpc SearchByGeo (SearchByGeoRequest) returns (SearchByGeoResponse) {}
+
+  // Search by city
+  //
+  // Find available properties in or around a city, identified by either its GeoNames id or its url name --
+  // both are on the same `City` message the Lookup service and every pricing/content result return, so you
+  // never need a lookup round trip just to convert one identifier to the other.
+  //
+  // Returns INVALID_ARGUMENT if you send neither.
+  rpc SearchByCity (SearchByCityRequest) returns (SearchByCityResponse) {}
+
+  // Rank YOUR OWN managed properties
+  //
+  // Return the properties in your own managed portfolio, ordered by the scoring type you choose --
+  // "your own" meaning the account you called with (`managing-entity-id`), not a request field: this is
+  // the one Search RPC with no identifier for WHICH agency, because the account making the call IS the
+  // agency. Typical callers are a management company or hotel chain (`ManagingEntityType.MANAGEMENT_COMPANY`
+  // or `CHAIN`) that operates properties on behalf of their owners and calls the Partner API with its own
+  // credentials to see everything it represents.
+  //
+  // This is why it is the one ranked call with no `search_filters`: it is not a marketplace search, it is
+  // a listing of what you already manage, so filters like star rating or lifestyle would be filtering your
+  // own portfolio rather than discovering new inventory. Optionally narrow it to one city or country with
+  // `scope`; omit it to rank everything you manage.
+  rpc RankByAgency (RankByAgencyRequest) returns (RankByAgencyResponse) {}
+
+  // Rank a city's properties
+  //
+  // Return properties in or around a city, identified by either its url name or its GeoNames id, ordered
+  // by the scoring type you choose.
+  //
+  // Returns INVALID_ARGUMENT if you send neither.
+  rpc RankByCity (RankByCityRequest) returns (RankByCityResponse) {}
+
+  // Rank a country's properties
+  //
+  // Return properties within a country, ordered by the scoring type you choose.
+  rpc RankByCountry (RankByCountryRequest) returns (RankByCountryResponse) {}
+
+  // Rank properties worldwide
+  //
+  // Return the best-scoring properties across the whole platform. Use this for editorial and discovery
+  // surfaces rather than for a destination search.
+  rpc RankGlobal (RankGlobalRequest) returns (RankGlobalResponse) {}
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Requests
+// ---------------------------------------------------------------------------------------------------
+
+// Request for SearchByGeo.
+message SearchByGeoRequest {
+
+  // Traveller context: dates, occupancy, language and currency. Required.
+  UserSession user_session = 1;
+
+  // Where to search. Required. A point, a polygon, or a multi-polygon — see GeoShape.
+  //
+  // The geometry you choose decides how the search behaves: a point searches outward to
+  // `radius_in_meters` and orders results nearest first; a polygon or multi-polygon tests containment,
+  // takes no radius, and has no distance to order by.
+  GeoShape area = 2;
+
+  // How far to search from a point, in metres. Only valid when `area` holds a point; sending it with a
+  // polygon is rejected with INVALID_ARGUMENT rather than ignored, because a silently dropped radius
+  // returns a plausible page that is not the search you asked for. Defaults to 1000 when omitted.
+  int64 radius_in_meters = 3;
+
+  // Optional narrowing of the result set.
+  SearchFilters search_filters = 4;
+
+  // Zero-based page number. Defaults to 0.
+  int32 page = 5;
+
+  // Results per page. Defaults to 20, which is also the maximum. A larger value is rejected with
+  // INVALID_ARGUMENT rather than clamped, so a caller never pages through a result set believing it is
+  // larger than it is. Every property returned is billed, so the cap bounds cost as well as fan-out.
+  int32 size = 6;
+
+  // IANA media type for image delivery URLs: image/jpeg (the default), image/png, image/webp, or image/*
+  // to let the CDN negotiate per client from its Accept header. Empty means image/jpeg.
+  //
+  // An unrecognised value is rejected with INVALID_ARGUMENT rather than quietly falling back, so a typo
+  // like "image/jpg" (not a media type) fails loudly instead of serving you JPEG while you believe you
+  // asked for something else. Whatever is served is echoed back on `MediaUrlVariant.format`.
+  string image_format = 7;
+}
+
+// Response for SearchByGeo.
+message SearchByGeoResponse {
+
+  PropertyPage page = 1;
+
+  // ISO 4217 currency EVERY amount in this response is denominated in — the one you asked for in
+  // `user_session.currency_code`, or the property's own when you asked for none. Stated once here rather than
+  // repeated on every amount, which is why the amounts themselves are bare integers.
+  string currency_code = 2;
+
+  // How many decimal places `currency_code` has: 2 for THB and USD, 0 for JPY, KRW and VND.
+  //
+  // Amounts are integers in MINOR UNITS, so the real value is `amount / 10^currency_exponent`. This is
+  // published rather than assumed because a fixed divide-by-100 is wrong for a real slice of Wink's
+  // inventory — a JPY stay priced at 15000 is ¥15,000, not ¥150.
+  int32 currency_exponent = 3;
+
+  // ISO 639-1 language the names and other text in this response are in — the one you asked for in
+  // `user_session.language_code`, or English when it was unavailable.
+  string language_code = 4;
+}
+
+// Request for SearchByCity.
+message SearchByCityRequest {
+
+  // Traveller context. Required.
+  UserSession user_session = 1;
+
+  // Which city to search, identified either by its GeoNames id or its url name. Exactly one of these must
+  // be set -- both name the same city, so it is never useful to send both, and the query runs a single
+  // indexed match on whichever one you send. See the maintainer note near the top of this file for why
+  // this is not an `$or` across both.
+  oneof city {
+
+    // GeoNames id of the city, as returned by the Lookup service or `City.geo_name_id` on a
+    // pricing/content result.
+    string geo_name_id = 2;
+
+    // Url-safe city slug, as returned by the Lookup service or `City.url_name` on a pricing/content
+    // result. NOTE: `City.url_name` is empty for roughly a fifth of properties -- check it is set before
+    // relying on it.
+    string url_name = 7;
+  }
+
+  // Optional narrowing of the result set.
+  SearchFilters search_filters = 3;
+
+  // Zero-based page number. Defaults to 0.
+  int32 page = 4;
+
+  // Results per page. Defaults to 20, which is also the maximum. A larger value is rejected with
+  // INVALID_ARGUMENT rather than clamped, so a caller never pages through a result set believing it is
+  // larger than it is. Every property returned is billed, so the cap bounds cost as well as fan-out.
+  int32 size = 5;
+
+  // IANA media type for image delivery URLs: image/jpeg (the default), image/png, image/webp, or image/*
+  // to let the CDN negotiate per client from its Accept header. Empty means image/jpeg.
+  //
+  // An unrecognised value is rejected with INVALID_ARGUMENT rather than quietly falling back, so a typo
+  // like "image/jpg" (not a media type) fails loudly instead of serving you JPEG while you believe you
+  // asked for something else. Whatever is served is echoed back on `MediaUrlVariant.format`.
+  string image_format = 6;
+}
+
+// Response for SearchByCity.
+message SearchByCityResponse {
+
+  PropertyPage page = 1;
+
+  // ISO 4217 currency EVERY amount in this response is denominated in — the one you asked for in
+  // `user_session.currency_code`, or the property's own when you asked for none. Stated once here rather than
+  // repeated on every amount, which is why the amounts themselves are bare integers.
+  string currency_code = 2;
+
+  // How many decimal places `currency_code` has: 2 for THB and USD, 0 for JPY, KRW and VND.
+  //
+  // Amounts are integers in MINOR UNITS, so the real value is `amount / 10^currency_exponent`. This is
+  // published rather than assumed because a fixed divide-by-100 is wrong for a real slice of Wink's
+  // inventory — a JPY stay priced at 15000 is ¥15,000, not ¥150.
+  int32 currency_exponent = 3;
+
+  // ISO 639-1 language the names and other text in this response are in — the one you asked for in
+  // `user_session.language_code`, or English when it was unavailable.
+  string language_code = 4;
+}
+
+// Request for RankByAgency.
+message RankByAgencyRequest {
+
+  // Traveller context. Required.
+  UserSession user_session = 1;
+
+  // Narrows your managed portfolio to one city or country. Optional -- omit to rank everything you
+  // manage. At most one of these is set (protobuf oneof), mirroring `City`'s two city forms plus a
+  // country option: a caller holding a `City` from a search result can scope by whichever identifier it
+  // has, and a caller who only knows the country is not forced to look up a city first.
+  oneof scope {
+
+    // GeoNames id of the city, as returned by the Lookup service or `City.geo_name_id` on a
+    // pricing/content result.
+    string city_geo_name_id = 2;
+
+    // Url-safe city slug, as returned by the Lookup service or `City.url_name` on a pricing/content
+    // result.
+    string city_url_name = 7;
+
+    // ISO 3166-1 alpha-2 country code, e.g. "TH".
+    string country_code = 8;
+  }
+
+  // How to order the results.
+  ScoreSort sort = 3;
+
+  // Zero-based page number. Defaults to 0.
+  int32 page = 4;
+
+  // Results per page. Defaults to 20, which is also the maximum. A larger value is rejected with
+  // INVALID_ARGUMENT rather than clamped, so a caller never pages through a result set believing it is
+  // larger than it is. Every property returned is billed, so the cap bounds cost as well as fan-out.
+  int32 size = 5;
+
+  // IANA media type for image delivery URLs: image/jpeg (the default), image/png, image/webp, or image/*
+  // to let the CDN negotiate per client from its Accept header. Empty means image/jpeg.
+  //
+  // An unrecognised value is rejected with INVALID_ARGUMENT rather than quietly falling back, so a typo
+  // like "image/jpg" (not a media type) fails loudly instead of serving you JPEG while you believe you
+  // asked for something else. Whatever is served is echoed back on `MediaUrlVariant.format`.
+  string image_format = 6;
+}
+
+// Response for RankByAgency.
+message RankByAgencyResponse {
+
+  PropertyPage page = 1;
+
+  // ISO 4217 currency EVERY amount in this response is denominated in — the one you asked for in
+  // `user_session.currency_code`, or the property's own when you asked for none. Stated once here rather than
+  // repeated on every amount, which is why the amounts themselves are bare integers.
+  string currency_code = 2;
+
+  // How many decimal places `currency_code` has: 2 for THB and USD, 0 for JPY, KRW and VND.
+  //
+  // Amounts are integers in MINOR UNITS, so the real value is `amount / 10^currency_exponent`. This is
+  // published rather than assumed because a fixed divide-by-100 is wrong for a real slice of Wink's
+  // inventory — a JPY stay priced at 15000 is ¥15,000, not ¥150.
+  int32 currency_exponent = 3;
+
+  // ISO 639-1 language the names and other text in this response are in — the one you asked for in
+  // `user_session.language_code`, or English when it was unavailable.
+  string language_code = 4;
+}
+
+// Request for RankByCity.
+message RankByCityRequest {
+
+  // Traveller context. Required.
+  UserSession user_session = 1;
+
+  // Which city to rank, identified either by its url name or its GeoNames id. Exactly one of these must
+  // be set -- see `SearchByCityRequest.city` for why this is not an `$or` across both.
+  oneof city {
+
+    // Url name of the city, as returned by the Lookup service or `City.url_name` on a pricing/content
+    // result.
+    string url_name = 2;
+
+    // GeoNames id of the city, as returned by the Lookup service or `City.geo_name_id` on a
+    // pricing/content result.
+    string geo_name_id = 8;
+  }
+
+  // How to order the results.
+  ScoreSort sort = 3;
+
+  // Optional narrowing of the result set.
+  SearchFilters search_filters = 4;
+
+  // Zero-based page number. Defaults to 0.
+  int32 page = 5;
+
+  // Results per page. Defaults to 20, which is also the maximum. A larger value is rejected with
+  // INVALID_ARGUMENT rather than clamped, so a caller never pages through a result set believing it is
+  // larger than it is. Every property returned is billed, so the cap bounds cost as well as fan-out.
+  int32 size = 6;
+
+  // IANA media type for image delivery URLs: image/jpeg (the default), image/png, image/webp, or image/*
+  // to let the CDN negotiate per client from its Accept header. Empty means image/jpeg.
+  //
+  // An unrecognised value is rejected with INVALID_ARGUMENT rather than quietly falling back, so a typo
+  // like "image/jpg" (not a media type) fails loudly instead of serving you JPEG while you believe you
+  // asked for something else. Whatever is served is echoed back on `MediaUrlVariant.format`.
+  string image_format = 7;
+}
+
+// Response for RankByCity.
+message RankByCityResponse {
+
+  PropertyPage page = 1;
+
+  // ISO 4217 currency EVERY amount in this response is denominated in — the one you asked for in
+  // `user_session.currency_code`, or the property's own when you asked for none. Stated once here rather than
+  // repeated on every amount, which is why the amounts themselves are bare integers.
+  string currency_code = 2;
+
+  // How many decimal places `currency_code` has: 2 for THB and USD, 0 for JPY, KRW and VND.
+  //
+  // Amounts are integers in MINOR UNITS, so the real value is `amount / 10^currency_exponent`. This is
+  // published rather than assumed because a fixed divide-by-100 is wrong for a real slice of Wink's
+  // inventory — a JPY stay priced at 15000 is ¥15,000, not ¥150.
+  int32 currency_exponent = 3;
+
+  // ISO 639-1 language the names and other text in this response are in — the one you asked for in
+  // `user_session.language_code`, or English when it was unavailable.
+  string language_code = 4;
+}
+
+// Request for RankByCountry.
+message RankByCountryRequest {
+
+  // Traveller context. Required.
+  UserSession user_session = 1;
+
+  // ISO 3166-1 alpha-2 country code, e.g. "TH". Required.
+  string country_code = 2;
+
+  // How to order the results.
+  ScoreSort sort = 3;
+
+  // Optional narrowing of the result set.
+  SearchFilters search_filters = 4;
+
+  // Zero-based page number. Defaults to 0.
+  int32 page = 5;
+
+  // Results per page. Defaults to 20, which is also the maximum. A larger value is rejected with
+  // INVALID_ARGUMENT rather than clamped, so a caller never pages through a result set believing it is
+  // larger than it is. Every property returned is billed, so the cap bounds cost as well as fan-out.
+  int32 size = 6;
+
+  // IANA media type for image delivery URLs: image/jpeg (the default), image/png, image/webp, or image/*
+  // to let the CDN negotiate per client from its Accept header. Empty means image/jpeg.
+  //
+  // An unrecognised value is rejected with INVALID_ARGUMENT rather than quietly falling back, so a typo
+  // like "image/jpg" (not a media type) fails loudly instead of serving you JPEG while you believe you
+  // asked for something else. Whatever is served is echoed back on `MediaUrlVariant.format`.
+  string image_format = 7;
+}
+
+// Response for RankByCountry.
+message RankByCountryResponse {
+
+  PropertyPage page = 1;
+
+  // ISO 4217 currency EVERY amount in this response is denominated in — the one you asked for in
+  // `user_session.currency_code`, or the property's own when you asked for none. Stated once here rather than
+  // repeated on every amount, which is why the amounts themselves are bare integers.
+  string currency_code = 2;
+
+  // How many decimal places `currency_code` has: 2 for THB and USD, 0 for JPY, KRW and VND.
+  //
+  // Amounts are integers in MINOR UNITS, so the real value is `amount / 10^currency_exponent`. This is
+  // published rather than assumed because a fixed divide-by-100 is wrong for a real slice of Wink's
+  // inventory — a JPY stay priced at 15000 is ¥15,000, not ¥150.
+  int32 currency_exponent = 3;
+
+  // ISO 639-1 language the names and other text in this response are in — the one you asked for in
+  // `user_session.language_code`, or English when it was unavailable.
+  string language_code = 4;
+}
+
+// Request for RankGlobal.
+message RankGlobalRequest {
+
+  // Traveller context. Required.
+  UserSession user_session = 1;
+
+  // How to order the results.
+  ScoreSort sort = 2;
+
+  // Optional narrowing of the result set.
+  SearchFilters search_filters = 3;
+
+  // Zero-based page number. Defaults to 0.
+  int32 page = 4;
+
+  // Results per page. Defaults to 20, which is also the maximum. A larger value is rejected with
+  // INVALID_ARGUMENT rather than clamped, so a caller never pages through a result set believing it is
+  // larger than it is. Every property returned is billed, so the cap bounds cost as well as fan-out.
+  int32 size = 5;
+
+  // IANA media type for image delivery URLs: image/jpeg (the default), image/png, image/webp, or image/*
+  // to let the CDN negotiate per client from its Accept header. Empty means image/jpeg.
+  //
+  // An unrecognised value is rejected with INVALID_ARGUMENT rather than quietly falling back, so a typo
+  // like "image/jpg" (not a media type) fails loudly instead of serving you JPEG while you believe you
+  // asked for something else. Whatever is served is echoed back on `MediaUrlVariant.format`.
+  string image_format = 6;
+}
+
+// Response for RankGlobal.
+message RankGlobalResponse {
+
+  PropertyPage page = 1;
+
+  // ISO 4217 currency EVERY amount in this response is denominated in — the one you asked for in
+  // `user_session.currency_code`, or the property's own when you asked for none. Stated once here rather than
+  // repeated on every amount, which is why the amounts themselves are bare integers.
+  string currency_code = 2;
+
+  // How many decimal places `currency_code` has: 2 for THB and USD, 0 for JPY, KRW and VND.
+  //
+  // Amounts are integers in MINOR UNITS, so the real value is `amount / 10^currency_exponent`. This is
+  // published rather than assumed because a fixed divide-by-100 is wrong for a real slice of Wink's
+  // inventory — a JPY stay priced at 15000 is ¥15,000, not ¥150.
+  int32 currency_exponent = 3;
+
+  // ISO 639-1 language the names and other text in this response are in — the one you asked for in
+  // `user_session.language_code`, or English when it was unavailable.
+  string language_code = 4;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Request value types
+// ---------------------------------------------------------------------------------------------------
+
+
+
+
+
+// Optional narrowing applied before scoring.
+//
+// Every field here narrows WHICH properties match, on all six RPCs alike. The search radius used to sit
+// here too and did not belong: it is not a filter but half of a geometry — meaningless on the five
+// non-geo calls, and meaningless on SearchByGeo itself unless `area` holds a point. It lives on
+// SearchByGeoRequest, next to the point it measures from.
+message SearchFilters {
+
+  // Fuzzy match on property name.
+  string name_sounds_like = 1;
+
+  // Restrict to properties oriented toward this lifestyle.
+  LifestyleType lifestyle = 3;
+
+  // Minimum star rating, 1-5.
+  int32 star_rating = 4;
+
+  // Only properties bookable direct, excluding intermediated inventory.
+  bool direct_only = 5;
+}
+
+// How ranked results are ordered.
+//
+// Four orderings, and they are the only four the platform actually has. Wink previously scored properties
+// on separate member, popularity, experience, perk, loyalty and add-on dimensions; those collapsed into a
+// single demand score in 2026-07 and their backing fields no longer exist. The REST enum keeps them as
+// deprecated aliases so persisted documents keep loading — every one silently resolves to RECOMMENDED —
+// but this contract is new, so it publishes only what it can honour. A sort you can select and that does
+// nothing is worse than one you cannot select.
+enum ScoreSort {
+
+  // Not set; the server picks RECOMMENDED.
+  SCORE_SORT_UNSPECIFIED = 0;
+
+  // Wink's demand score — bookings and reviews blended, 0-100. The default.
+  SCORE_SORT_RECOMMENDED = 1;
+
+  // Cheapest first.
+  SCORE_SORT_PRICE_LOW_TO_HIGH = 2;
+
+  // Most expensive first.
+  SCORE_SORT_PRICE_HIGH_TO_LOW = 3;
+
+  // Sustainability, highest first — backed by the green-index rating, which is maintained separately from
+  // the demand score.
+  SCORE_SORT_ECO = 4;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Search-only offer shape
+// ---------------------------------------------------------------------------------------------------
+
+// MAINTAINER NOTES — NOT PUBLISHED.
+//
+// SearchRoomTypeOffers/SearchRoomRate are deliberate near-duplicates of RoomTypeOffers/RoomRate in
+// partner_common.proto. Search and Inventory answer different questions and had been sharing one message,
+// which meant Search shipped `add_on_ids` (documented "always empty on Search", and it was) and
+// `room_type_ancillaries` (full per-offer objects, ungated) on every rate of every result. A list surface
+// carrying a detail surface's payload.
+//
+// The two messages use the SAME TAG NUMBER for the same field, and SearchRoomRate reserves the two tags it
+// drops. That is what keeps this duplication maintainable: the messages diff cleanly, and a field added to
+// one can be added to the other at the same number. When you change RoomRate, look here.
+//
+// JSON field names are unchanged, so this is invisible to an integrator except for the two fields removed
+// and `add_on_count` gained.
+
+message SearchRoomTypeOffers {
+
+  // The room type. Join to Content for the full gallery, amenities and long-form descriptions.
+  string room_type_id = 1;
+
+  // The room type's name, in the requested language where a translation exists.
+  string name = 2;
+
+  // A ready-to-use delivery URL for a single representative image of the room, scaled to 1024px wide
+  // (Cloudinary's medium variant — c_scale, dpr_auto, f_auto, q_auto:best, w_1024). The lowest-sorted
+  // published image; unset when the room has none.
+  //
+  // A plain URL rather than the full Multimedia object deliberately: this is a rates surface, not a
+  // content surface, and shipping the full media object -- id, descriptions, every delivery-URL variant
+  // -- for every room type on every rate response would make the payload about images instead of about
+  // rates. The complete gallery is in Content.
+  optional string hero_image_url = 3;
+
+  // The single best offer for this room -- one entry, not a list of every rate and occupancy combination.
+  // Repeated rather than singular so that a room whose rate WAS computed but is not bookable (occupancy
+  // mismatch, sold out) can still report it, rather than vanishing from the results.
+  //
+  // EMPTY, not a single unavailable entry, when the room type has no priced rate to report at all --
+  // master rates exist but none priced for these dates. That case has nothing meaningful to distinguish
+  // one property's placeholder from another's on a page ranking hundreds of them, so it is omitted rather
+  // than published as an all-blank entry.
+  //
+  // Unavailable-but-computed offers sort last, never first: they report 0 across all amounts, so ordering
+  // purely by price would put "not priced" ahead of the cheapest real rate. For every rate and occupancy
+  // combination, call Inventory.
+  repeated SearchRoomRate rates = 4;
+
+  // The property's own display order for its room types, ascending, when it has expressed one; 0 when it
+  // has not. This describes the ROOM, which is why it is here rather than on each rate -- the domain
+  // defines it as "how the room types should be sorted and displayed".
+  //
+  // It is a merchandising hint, not the delivered order: `room_types` is already ordered by price.
+  int32 sort = 5;
+}
+
+message SearchRoomRate {
+  // Stable identifier for this offer, and the id you carry into a booking.
+  //
+  // This IS the master rate identifier — it maps from `roomRateIdentifier`, whose own schema calls it
+  // "Specified master rate identifier". The name says `room_rate` for historical reasons and is kept rather
+  // than duplicated: publishing a second `master_rate_id` field with the same value would be two
+  // representations of one thing that can disagree, which this API forbids elsewhere for prices.
+  string room_rate_id = 1;
+
+  // The rate plan this offer sells under. Resolve it with Content's GetRatePlan; a rate plan is shared by
+  // many offers, so it is referenced rather than repeated on each one.
+  string rate_plan_id = 4;
+
+  // True if THIS offer, at the requested occupancy, is bookable for the itinerary. Narrower than
+  // `PropertySearchResult.available`, which is true when ANY offer at the property is. An unavailable offer is
+  // still returned rather than dropped, so you can show the traveller why it cannot be booked.
+  bool available = 3;
+
+  // Check-in date, ISO-8601 "YYYY-MM-DD".
+  string start_date = 5;
+
+  // Check-out date, ISO-8601 "YYYY-MM-DD".
+  string end_date = 6;
+
+  // Nights covered by this rate.
+  int32 room_nights = 7;
+
+  // Adults the rate is priced for, after the property's occupancy policy is applied.
+  int32 adults = 8;
+
+  // Children the rate is priced for, after the property's occupancy policy is applied.
+  int32 children = 9;
+
+  // ONE room, whole stay, BEFORE discounts — step 1 above. The "was" price: render it struck through next
+  // to `unit_price`.
+  //
+  // GUARANTEED >= `unit_price`. Occupancy surcharges and rate premiums are already inside it, so the gap
+  // between the two is only ever the discounts. Equal to `unit_price` when nothing is discounted, in which
+  // case show no strikethrough.
+  int64 unit_strikethrough_price = 10;
+
+  // ONE room, whole stay, after every adjustment — step 2 above. The "now" price, and the figure the
+  // discount is measured against. Excludes the rate plan's fixed charges.
+  //
+  // Not named `net` or `source_total`: everywhere else in this platform "source" means the PROPERTY'S OWN
+  // CURRENCY, and this figure is in the caller's. Reusing the word would have the next mapper author reach
+  // for the domain's `getSourceTotal()` and quote the wrong currency.
+  int64 unit_price = 11;
+
+  // ONE room, whole stay — fixed charges attached to the rate plan, a one-time cleaning fee and the like.
+  // Reported separately so a traveller sees them as their own line rather than as an unexplained
+  // difference. NEVER discounted, which is why they sit outside both prices above. Zero when the rate plan
+  // has none.
+  int64 unit_extra_charges = 12;
+
+  // What the guest pays for every room: `(unit_price + unit_extra_charges) x quantity`. This is the number
+  // to show and the number to charge.
+  //
+  // Only meaningful when `available` is true. An unavailable offer reports 0 across every amount, which
+  // means "not priced" rather than "free" — show the offer with its reason, never with a price of zero.
+  int64 total = 13;
+
+  // Meals included in the rate. These change which offer a traveller picks, so they are here rather than
+  // behind an identifier.
+  MealPlan meals = 14;
+
+  // True if the stay can be cancelled without charge before the policy's deadline.
+  bool refundable = 15;
+
+  // How many days from TODAY the traveller has left to cancel free of charge, and -1 when the rate is not
+  // refundable at all. Zero means the free-cancellation window closes today.
+  //
+  // Derived as (days until check-in) − (the policy's days-before-arrival deadline), floored at 0 — the same
+  // calculation `RoomTypeBestPriceForDateRange` publishes. It is relative to the moment of the response and
+  // will drift as the stay approaches, so treat it as display data, not something to cache.
+  int32 refundable_until_days = 16;
+
+  // Cancellation policy identifier. Join to Content for the full terms and wording.
+  string cancellation_policy_id = 17;
+
+  // Identifiers of the perks bundled with this rate. Join to Content for their names and descriptions.
+  // There is deliberately no monetary "perk value" on this surface.
+  repeated string perk_ids = 18;
+
+  // How many identical rooms this offer is priced for — the `quantity` you set on the matching
+  // `RoomConfiguration`. At least 1. What the PROPERTY has left is `rooms_left`, which is a different
+  // number entirely.
+  //
+  // It is echoed back because it is a MULTIPLIER on `total`, not merely a restatement of your request:
+  // without it you cannot tell whether `total` covers one room or five. It can also change the unit price
+  // itself, since a property may attach a rate to a room-count range — book three and every room may be
+  // cheaper than booking one.
+  int32 quantity = 20;
+
+  // The saving as a fraction of `unit_strikethrough_price` — 0.15 for 15%. Zero when nothing is
+  // discounted.
+  //
+  // Published rather than left to you because there is one correct rounding of it and several plausible
+  // ones, and a paid API where two integrators compute "18%" and "17%" from the same response is a support
+  // burden rather than a saving. Quantity-invariant: discounting every room equally does not change the
+  // percentage.
+  double discount_percent = 21;
+
+  // Every adjustment that moved this rate away from the property's plain price, one entry per kind, for
+  // showing a traveller WHY the number is what it is. Empty when nothing applied.
+  //
+  // These reconcile exactly: the signed amounts sum to `unit_price` minus the property's unadjusted price.
+  // They are per-unit, like the prices they explain.
+  repeated PriceAdjustment adjustments = 22;
+
+  // The property's own wording for the promotion or premium in force, in English plus your requested
+  // language. Empty when neither applies.
+  //
+  // At the RATE level, not on each adjustment, because that is how the platform stores it — one list of
+  // descriptions covering the special rates that fired. Attaching a label to each `PriceAdjustment` would
+  // have meant publishing a field nothing could ever fill.
+  repeated Description offer_details = 23;
+
+  // Promotional codes that were actually ACCEPTED and are reflected in the price above — not the codes you
+  // sent. A code your account is not entitled to is ignored rather than rejected, so comparing this against
+  // what you submitted is how you tell which ones bit.
+  repeated string promotional_codes = 24;
+
+  // How many rooms the property still has for the WHOLE stay — the "only 2 left" number.
+  //
+  // The SMALLEST nightly allotment across the stay, not the first night's and not an average. A three-night
+  // stay whose middle night has two rooms free has two rooms left, however many are free either side: you
+  // cannot sell a third room a guest would be evicted from on night two. The check-out date is excluded,
+  // since nobody occupies a room that night.
+  //
+  // NOT the same as `quantity`, which is how many rooms YOU asked for. The relationship is
+  // `rooms_left >= quantity` whenever `available` is true — an offer that cannot house the party you
+  // requested is not bookable and says so. Reading `quantity` as "what the property has" overstates
+  // availability, which is why they are named as differently as they are.
+  //
+  // Zero means none are free for these dates, and only ever appears alongside `available = false`. It is
+  // a real answer, not a missing one.
+  //
+  // This is the property's true position, not a banded or capped figure. Treat it as commercially
+  // sensitive: it is exact enough to reconstruct a property's booking curve if sampled over time.
+  int32 rooms_left = 25;
+
+  // Tags 19 and 27 held `add_on_ids` and `room_type_ancillaries`, which this message deliberately does not
+  // carry -- see `add_on_count`. Reserved rather than reused so the two messages stay diffable: every tag
+  // SearchRoomRate does declare means exactly what the same tag means on RoomRate.
+  reserved 19, 27;
+
+  // How many extras -- add-ons plus in-room ancillaries -- can be bought alongside this offer. Zero when
+  // it sells none.
+  //
+  // A COUNT, not the items. Search is a list surface: the count is enough to render "3 extras available"
+  // and decide whether to show a badge, and that is the only add-on decision a result row makes. The items
+  // themselves are per-offer objects with their own prices and booking identifiers, which is a detail-view
+  // payload -- fetch them from Inventory, where `RoomRate.add_on_ids` and `RoomRate.room_type_ancillaries`
+  // carry the full picture.
+  //
+  // The two kinds are summed rather than reported separately because nothing you can do with this number
+  // on a search row distinguishes them. They ARE different at booking time -- an ancillary quotes this
+  // rate's `room_rate_id` as its inventory id, an add-on does not -- and that difference is exactly why
+  // resolving them belongs to the surface that can act on it.
+  int32 add_on_count = 28;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Responses
+// ---------------------------------------------------------------------------------------------------
+
+// One page of priced properties.
+//
+// Wire mirror of the REST PageResponse envelope: `number` is zero-based and `total_elements` counts across
+// all pages, not this one.
+message PropertyPage {
+
+  // The properties on this page.
+  repeated PropertySearchResult content = 1;
+
+  // Zero-based index of this page.
+  int32 number = 2;
+
+  // Requested page size.
+  int32 size = 3;
+
+  // Total matching properties across all pages.
+  int64 total_elements = 4;
+
+  // Total number of pages.
+  int32 total_pages = 5;
+
+  // Properties on this page. Differs from `size` on the last page.
+  int32 number_of_elements = 6;
+
+  // True if this is the first page.
+  bool first = 7;
+
+  // True if this is the last page.
+  bool last = 8;
+
+}
+
+// One property and its live prices.
+//
+// Carries only what a result list needs to render, plus the prices. For anything else about the property —
+// descriptions, full gallery, address, amenities, room detail, policies — call the Content service with
+// `property_id` and cache the answer against `last_update`.
+message PropertySearchResult {
+
+  // Stable property identifier. Your key for everything, including Content lookups.
+  string property_id = 1;
+
+  // Url-safe slug, stable and safe to build links from.
+  string url_name = 2;
+
+  // The property's globally unique short code.
+  string unique_id = 3;
+
+  // Property name in the requested language. Enough to label a result row; full localized content comes
+  // from the Content service.
+  string name = 4;
+
+  // Where the property is, for map pins and distance sorting.
+  //
+  // Bare latitude and longitude, not GeoJSON: this field carries only coordinates, and the surrounding
+  // JSON already tells you what kind of thing they belong to. Named `geo_location` rather than `location`
+  // so a generated client's field name says what it is without opening the type.
+  GeoPosition geo_location = 5;
+
+  // The city this property is in, with the identifiers the destination surfaces take.
+  //
+  // Lets a result row offer "more properties in this city" without a Content call first: `geo_name_id`
+  // goes straight back into SearchByCity, `url_name` into RankByCity. Absent when the property has no
+  // city on record.
+  City city = 15;
+
+  // How far this property is from the point you searched from, in metres.
+  //
+  // Set only when `area` held a point — a polygon has no single origin to measure from, so this is
+  // unset on containment searches. On a point search the page is ordered by this value, nearest first.
+  //
+  // It is the distance to the property's nearest bookable inventory item, which is the property's own
+  // location for all current inventory types.
+  //
+  // `optional` so a genuine near-zero distance (the property is essentially at the search coordinates)
+  // is distinguishable from "not applicable": a plain, non-optional double serializes identically to
+  // its own default at exactly 0, so proto3 JSON would otherwise omit both cases the same way.
+  optional double distance_in_meters = 14;
+
+  // Official star rating, 1-5. Zero when unrated.
+  int32 star_rating = 6;
+
+  // A ready-to-use delivery URL for a single representative image of the property, scaled to 1024px wide
+  // (Cloudinary's medium variant), the same convention `SearchRoomTypeOffers.hero_image_url` already uses
+  // for a room. The lowest-sorted published image; unset when the property has none.
+  //
+  // A plain URL rather than the full Multimedia object deliberately: this is a pricing surface, not a
+  // content surface, and the full object carries localized captions, camera angle and lifestyle tagging --
+  // real content, not routing information for one image. The complete gallery is in Content.
+  optional string hero_image_url = 7;
+
+  // When this property's record last changed, ISO-8601 "YYYY-MM-DDThh:mm:ss" in UTC.
+  //
+  // Use it as the cache key for your Content responses: store it alongside what you fetched, compare on
+  // each search, and re-fetch only when it has moved. It advances when the property or any inventory item
+  // beneath it is added, removed or edited.
+  //
+  // Edits to child entities advance it too — room types, rate plans, master rates, cancellation policies and
+  // every ancillary item, on create, edit, remove and translate alike.
+  //
+  // One documented gap: PERKS. A perk is defined once for the whole platform rather than per property, so
+  // editing one cannot be attributed to a single property and does not move any property's value. Perk text
+  // you have cached can therefore go stale silently. Perks are small and few — the pricing surfaces return
+  // every perk referenced by a result inline — so read them from a search or inventory response rather than
+  // caching them against this value, and re-sync content periodically regardless.
+  string last_update = 8;
+
+  // Offers for this property, grouped by room type, cheapest room first. Search returns the single best
+  // offer per room type; use Inventory for every rate and occupancy combination.
+  repeated SearchRoomTypeOffers room_types = 13;
+
+  // Every perk referenced by any `RoomRate.perk_ids` above, deduplicated — one entry per distinct perk,
+  // not one per rate. Resolve a perk id here rather than calling Content; a handful of distinct perks
+  // typically cover every rate in this response.
+  repeated PerkContent perks = 9;
+
+  // Commission rate your account earns on this property, as a fraction — 0.15 for 15%. A property-channel
+  // term rather than a per-rate one: it describes your commercial relationship with the property, so it
+  // holds for every offer below.
+  //
+  // A double rather than a float because this multiplies money. 0.15 has no exact binary representation,
+  // and the wider type keeps the error far enough below a minor unit that `total * commission` does not
+  // drift into a visible discrepancy on large bookings.
+  double commission = 10;
+
+  // True if this is direct inventory, with no intermediary between you and the property.
+  bool direct = 11;
+
+  // True if AT LEAST ONE room type at this property is bookable for the itinerary. Per-room-type
+  // availability is `RoomPrice.available`; this is the "is anything here bookable at all" flag. When false,
+  // `prices` still carries the unavailable offers rather than being empty, so you can show why.
+  bool available = 12;
+}
+
+
+
+// MAINTAINER NOTE — NOT PUBLISHED.
+//
+// `Quote` (the FX rate pair) was removed from PropertySearchResult. Prices already arrive converted to the
+// session currency, so the rate itself was reference data an integrator could not act on. If a need to
+// reproduce a conversion appears later, add it back as a new field number — removing it now costs nothing
+// because nothing is bound to this contract yet.

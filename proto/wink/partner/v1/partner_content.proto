@@ -1,0 +1,1041 @@
+// Copyright (c) 2026 Wink.
+syntax = "proto3";
+
+package wink.partner.v1;
+
+import "wink/partner/v1/partner_common.proto";
+
+option java_package = "travel.wink.grpc.v1";
+option java_multiple_files = true;
+option java_outer_classname = "PartnerContentProto";
+
+// MAINTAINER NOTES — not part of the published document.
+//
+// Separated from the next declaration by a BLANK LINE so protoc classifies this as
+// `leading_detached_comments`; GrpcOpenApiGenerator reads only `leading_comments`.
+//
+// REPLACES `service Media` (partner_media.proto, shipped #693). Deleting the gRPC Media surface breaks
+// nobody: Cloud Run exposes exactly one port per service and it is the REST port, so
+// `spring.grpc.server.port` has never been reachable from outside — see the TRANSITION NOTE in
+// apps/partner-app/src/main/resources/application.properties. The REST twin (PartnerMediaController) dies
+// with the other three partner controllers in the REST cutover PR, not here.
+//
+// METERING: `MeterStrategy.PER_CALL`, billed under `PlatformFeature.PARTNER_API` — ONE unit per CALL,
+// whatever the call returned and whatever was included. Fifty properties cost what one does.
+//
+// This supersedes the per-property `MeterStrategy.MEDIA` / `PlatformFeature.PARTNER_MEDIA_API` pair the
+// surface inherited from Media. NEITHER CONSTANT EXISTS ANY MORE — do not reintroduce them and do not
+// describe this surface as billing per property; an earlier revision of this note did, and it contradicted
+// the published GetProperties comment sitting forty lines below it.
+//
+// The consequence matters for the conditional-fetch mechanism below and is stated on `known_versions` too:
+// CONTENT_STATUS_NOT_MODIFIED saves bandwidth, projection CPU and client-side parsing, and saves NOTHING in
+// units, because a unit was never charged per property. A caller lowers spend by BATCHING, not by caching.
+// If that trade is ever meant to bill differently, the meter strategy is what changes — not this document.
+//
+// Billing lives on the domain service (`@Metered(MeterStrategy.PER_CALL)`), NOT here and NOT on the
+// gRPC service — the "one meter, two transports" arrangement. PartnerContentGrpcService must therefore do
+// authorization and validation only, and must NEVER call PartnerGrpcUsageGuard (free-surface only).
+//
+// WHY AN INCLUDE MECHANISM HERE BUT NOT ON SEARCH. Search deliberately has no opt-in to inline static
+// content, because two sources for the same data means two versions that can disagree within a response.
+// That objection does not apply here: Content IS the single source. `include` chooses how much of one
+// coherent snapshot to return in a single call, which is a payload decision, not a consistency one.
+//
+// SERVER-SIDE CACHING — CACHE WHOLE, PROJECT ON THE WAY OUT. The implementation caches the ENTIRE property
+// object per property (the property plus all of its static inventory content), then projects that cached
+// bundle down to the `include` scopes the caller asked for. It does NOT cache per scope combination.
+//   * That is what makes one property-scoped `content_version` correct: there is one cache entry per property, so
+//     there is one thing to version. Per-scope caching would need per-scope versions, and a caller that
+//     asked for two scopes could be handed two snapshots taken at different times.
+//   * It also keeps the cache dense. With 13 scopes there are thousands of possible include combinations;
+//     keying on them would shred the hit rate and let one property occupy many entries.
+//   * Consequence to respect when implementing: a cache miss costs the same regardless of how little the
+//     caller asked for, and eviction is all-or-nothing per property. Do not "optimise" by caching projections.
+//
+// TWO VERSION VALUES, AND WHY THEY ARE NOT ONE FIELD. `content_version` and `cache_token` are the
+// Last-Modified / ETag split, and collapsing them was considered and rejected.
+//   * `content_version` describes the PROPERTY. It is `PropertyAggregate.lastUpdate` rendered literally, and
+//     it is byte-for-byte the `last_update` the pricing surfaces publish for the same property. That equality
+//     is a published promise ("re-fetch when a search shows a different one") and three other documents in
+//     this package repeat it. Folding anything request-shaped into it breaks all four at once.
+//   * `cache_token` describes this REPRESENTATION — the same property as seen through one caller's channel,
+//     language, `include` set and media cap. HTTP needs `Vary:` for exactly this reason; an opaque token
+//     carries it implicitly instead.
+// The split is what makes conditional fetch fail SAFE. Fetch with `include = [PROPERTY_DETAILS]`, then ask
+// again with `include = [ROOM_TYPE]` and the same token: the token no longer matches, so the caller gets a
+// full response. Had the token been the bare timestamp, the server would have answered NOT_MODIFIED and the
+// caller would never have received room types — silently, and forever.
+//
+// ENTITLEMENT IS AN INPUT TO THE TOKEN, and must stay one. A sales channel gaining or losing a master rate
+// changes `room_types`, `rate_plans`, `cancellation_policies` and `perks` WITHOUT moving `lastUpdate`, since
+// the property document did not change. A token that ignored the channel would pin that caller to
+// NOT_MODIFIED across the very change they are paying to see. It costs nothing to include: the channel query
+// already runs once per property on every request, to scope the response.
+//
+// The token carries a SCHEME PREFIX (`ContentCacheToken.SCHEME`). Bump it whenever the projection changes
+// what it emits for unchanged inputs — it is the only lever that invalidates every integrator's cache at
+// once, and without it a projection bug would keep being papered over by NOT_MODIFIED.
+//
+// MEASURED — and what the measurement changed. Every message below was walked against the domain type
+// that actually feeds it before this file was published. Three of them did not survive contact:
+//
+//   * RatePlanContent.descriptions — DELETED. Neither `RatePlan` nor `RatePlanLightweight` has a
+//     descriptions field anywhere in the domain; only an untranslated `name`. The field could never have
+//     been populated. The meal-inclusion booleans that replaced it are real, and are what the
+//     CONTENT_SCOPE_RATE_PLAN comment was already promising callers.
+//   * CancellationPolicyContent.name / .descriptions — DELETED, same reason: `CancellationPolicy` has
+//     neither. What it does carry is a charge ladder, which is now published as the ladder.
+//   * CancellationPolicyContent.free_cancellation_hours_before — DELETED. The domain models this in DAYS
+//     (`AdvanceCancellationFreeOfCharge.getDaysBeforeArrival()`), so an hours-named field would have
+//     shipped a number that was wrong rather than merely absent — the worse of the two failures, because
+//     an empty field gets noticed and a plausible one does not.
+//
+// The lesson generalises: a field that looks present on a Java type may be view-gated off, and one that
+// looks absent may serialize. Measure against the projection, not the class. Field numbers were reassigned
+// rather than `reserved` because nothing had shipped yet — see the pre-ship rule in partner_search.proto.
+// That rule expires the moment this document goes live: from then on, removed tags MUST be `reserved`.
+
+// Retrieve everything static about a property and its inventory — the paid Partner Content API.
+//
+// Content is the single source of truth for anything that does not change per search: names, descriptions,
+// addresses, galleries, room detail, amenities, policies, rate plans and cancellation terms. The pricing
+// endpoints deliberately do not return it, so fetch it here, cache it per property, and re-fetch only when the
+// `content_version` on a search result stops matching the one you stored.
+//
+// Already hold a copy? Send the `cache_token` you were given back in `known_versions` and any property that
+// has not changed returns CONTENT_STATUS_NOT_MODIFIED with no content, so a nightly catalogue sync transfers
+// only what actually moved. It does not reduce your bill — you are charged per call, not per property — but
+// it cuts response size and the work on both ends. See `known_versions`.
+//
+// Descriptions come back in English plus the language you request, so you always have a usable fallback
+// when a property has not translated a field.
+//
+// One call, one shape. By default you get the property's basic identity; ask for more with `include` and it
+// arrives in the same response rather than costing you another round trip. Billing does not change with
+// breadth: 1 unit per property returned, whatever you included.
+//
+// Requires an authenticated token with `INVENTORY:READ` on the account you pass.
+service Content {
+
+  // Get static content for one or more properties
+  //
+  // Pass up to 50 property identifiers. Every property we hold comes back with a `status` of
+  // CONTENT_STATUS_OK, and unknown identifiers come back CONTENT_STATUS_NOT_FOUND — the call itself
+  // succeeds, so a single bad identifier cannot fail the batch. A property you already hold an unchanged
+  // copy of comes back CONTENT_STATUS_NOT_MODIFIED when you pass its token in `known_versions`.
+  //
+  // Content is not restricted by your sales channel; the BOOKABLE collections are. See ContentStatus.
+  //
+  // Billing is one unit per CALL, not per property, whatever you included. Fifty properties in one call
+  // cost what one does, so batch.
+  //
+  // Returns INVALID_ARGUMENT when `property_ids` is empty, exceeds 50, or repeats an identifier, and when
+  // `known_versions` holds more than 50 entries.
+  rpc GetProperties (GetPropertiesRequest) returns (GetPropertiesResponse) {}
+
+  // Get one property by id
+  //
+  // The single-property shape of GetProperties, for a deep link or a cache fill when you hold one
+  // `property_id` and have no batch to make. Same content, same `include` scopes, same cache semantics.
+  //
+  // Costs one unit — the SAME as a fifty-property GetProperties. Fetching fifty properties one at a time
+  // therefore costs fifty times what one batched call would; reach for GetProperties whenever you hold
+  // more than one id. This rpc exists for convenience, not economy.
+  //
+  // Unlike GetProperties, an unknown id is an ERROR here rather than a per-entry status: with one property
+  // in the response there is no batch left to keep succeeding, so NOT_FOUND is the honest answer. The
+  // returned `status` is therefore only ever CONTENT_STATUS_OK or CONTENT_STATUS_NOT_MODIFIED.
+  //
+  // Returns NOT_FOUND for an unknown id, and INVALID_ARGUMENT when `property_id` is blank or
+  // `max_media_per_entity` is negative.
+  rpc GetProperty (GetPropertyRequest) returns (GetPropertyResponse) {}
+
+  // Get one room type by id
+  //
+  // For filling a cache or following a deep link when you already hold a `room_type_id` from
+  // `RoomTypeOffers`. To render a whole property, prefer GetProperties with CONTENT_SCOPE_ROOM_TYPE — it
+  // returns every room type you can sell in one call, for the same one unit.
+  //
+  // Costs one unit, the same as a fifty-property GetProperties. Three deep links cost three times what one
+  // batched call would; that is the intended pressure.
+  //
+  // Returns NOT_FOUND for an unknown id, and INVALID_ARGUMENT when `room_type_id` is blank.
+  rpc GetRoomType (GetRoomTypeRequest) returns (GetRoomTypeResponse) {}
+
+  // Get one rate plan by id
+  //
+  // As above, for a `rate_plan_id` from `RoomRate`.
+  rpc GetRatePlan (GetRatePlanRequest) returns (GetRatePlanResponse) {}
+
+  // Get one cancellation policy by id
+  //
+  // As above, for a `cancellation_policy_id` from `RoomRate`. The pricing surfaces already tell you whether
+  // an offer is refundable and until when; this tells you the terms behind that answer.
+  rpc GetCancellationPolicy (GetCancellationPolicyRequest) returns (GetCancellationPolicyResponse) {}
+}
+
+// Request for GetProperties.
+message GetPropertiesRequest {
+
+  // Properties to fetch, 1 to 50. Identifiers come from a search result's `property_id`.
+  repeated string property_ids = 2;
+
+  // ISO 639-1 language for descriptions, e.g. "th". English is ALWAYS returned alongside it, so a missing
+  // translation never leaves you with nothing to display. Defaults to English only.
+  string language_code = 3;
+
+  // What to include beyond the property's basic identity. Empty means basics only.
+  repeated ContentScope include = 4;
+
+  // Cap on images and videos returned per entity. Zero means no cap, which is the default — you are
+  // expected to cache the full bundle. Set this when you want a lighter response for a preview surface.
+  int32 max_media_per_entity = 5;
+
+  // Content you already hold: property identifier to the `cache_token` that property's last response carried.
+  //
+  // A property whose token still matches comes back CONTENT_STATUS_NOT_MODIFIED carrying its
+  // `content_version` and `cache_token` and nothing else — keep serving what you cached. Anything that has
+  // changed, and anything you did not list here, comes back in full as usual. Omit the field entirely and
+  // every property is returned in full, which is the default.
+  //
+  // Send back the `cache_token`, NOT the `content_version`. The token is opaque: do not parse it, do not
+  // build one, and do not assume anything about its length or alphabet. It covers the property's version AND
+  // the shape of the request that produced it — your sales channel, `language_code`, `include`,
+  // `max_media_per_entity`, `image_format` and `video_format` — which is precisely what makes it safe to
+  // change a request. Ask for a scope you did not have last time, or a different media format, and the token
+  // stops matching, so you get the full response rather than a NOT_MODIFIED that would have left you
+  // permanently missing the thing you just asked for.
+  //
+  // BILLING DOES NOT CHANGE. You are charged one unit per call whatever comes back, so this saves response
+  // size and processing on both ends, not money. Batching is what lowers a bill.
+  //
+  // Entries for properties absent from `property_ids` are ignored, so you may keep one map and reuse it
+  // across batches. At most 50 entries, the same bound as `property_ids`.
+  map<string, string> known_versions = 6;
+
+  // IANA media type for image delivery URLs: image/jpeg (the default), image/png, image/webp, or image/*
+  // to let the CDN negotiate per client from its Accept header. Empty means image/jpeg.
+  //
+  // An unrecognised value is rejected with INVALID_ARGUMENT rather than quietly falling back, so a typo
+  // like "image/jpg" (not a media type) fails loudly instead of serving you JPEG while you believe you
+  // asked for something else. Whatever is served is echoed back on `MediaUrlVariant.format`.
+  string image_format = 7;
+
+  // IANA media type for the PLAYABLE video delivery URLs, `stream` and `preview`: video/mp4 (the
+  // default) or video/webm. Empty means video/mp4.
+  //
+  // This does NOT affect `poster` and `thumbnail`. Those are still frames extracted from the video, so
+  // they are images and follow `image_format`. An unrecognised value is rejected with INVALID_ARGUMENT.
+  string video_format = 8;
+}
+
+// Response for GetProperties.
+message GetPropertiesResponse {
+
+  // One entry per requested property, in the order requested.
+  repeated PropertyContent properties = 1;
+}
+
+// Request for GetProperty.
+//
+// The single-property mirror of GetPropertiesRequest. Field names match it exactly so moving between the
+// two is a shape change and never a semantic one — the only differences are that `property_ids` becomes a
+// single `property_id`, and the `known_versions` map becomes the one `known_version` it would have held.
+message GetPropertyRequest {
+
+  // Property to fetch. Identifier comes from a search result's `property_id`.
+  string property_id = 1;
+
+  // ISO 639-1 language for descriptions, e.g. "th". English is ALWAYS returned alongside it, so a missing
+  // translation never leaves you with nothing to display. Defaults to English only.
+  string language_code = 2;
+
+  // What to include beyond the property's basic identity. Empty means basics only.
+  repeated ContentScope include = 3;
+
+  // Cap on images and videos returned per entity. Zero means no cap, which is the default.
+  int32 max_media_per_entity = 4;
+
+  // Content you already hold: the `cache_token` this property's last response carried.
+  //
+  // Matches and the response comes back CONTENT_STATUS_NOT_MODIFIED carrying its `content_version` and
+  // `cache_token` and nothing else — keep serving what you cached. Omit it and the property is returned in
+  // full, which is the default.
+  //
+  // Send back the `cache_token`, NOT the `content_version`. The same opacity rules as GetProperties apply:
+  // do not parse it, do not build one. It covers the property's version AND the shape of the request that
+  // produced it — `include`, `max_media_per_entity`, `image_format` and `video_format` among them — so
+  // widening a scope or changing a media format correctly stops it matching rather than leaving you
+  // permanently missing the thing you just asked for.
+  //
+  // BILLING DOES NOT CHANGE. One unit per call whatever comes back.
+  string known_version = 5;
+
+  // IANA media type for image delivery URLs: image/jpeg (the default), image/png, image/webp, or image/*
+  // to let the CDN negotiate per client from its Accept header. Empty means image/jpeg.
+  //
+  // An unrecognised value is rejected with INVALID_ARGUMENT rather than quietly falling back, so a typo
+  // like "image/jpg" (not a media type) fails loudly instead of serving you JPEG while you believe you
+  // asked for something else. Whatever is served is echoed back on `MediaUrlVariant.format`.
+  string image_format = 6;
+
+  // IANA media type for the PLAYABLE video delivery URLs, `stream` and `preview`: video/mp4 (the
+  // default) or video/webm. Empty means video/mp4.
+  //
+  // This does NOT affect `poster` and `thumbnail`. Those are still frames extracted from the video, so
+  // they are images and follow `image_format`. An unrecognised value is rejected with INVALID_ARGUMENT.
+  string video_format = 7;
+}
+
+// Response for GetProperty.
+message GetPropertyResponse {
+
+  // The property. Its `status` is CONTENT_STATUS_OK or CONTENT_STATUS_NOT_MODIFIED — an unknown id is a
+  // NOT_FOUND error on the call itself, not a status here.
+  PropertyContent property = 1;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// By-id lookups
+//
+// One entity, one call, for a caller that already holds the id. Every response is WRAPPED rather than
+// returning the entity bare, so an rpc can gain a sibling field later without a wire break.
+//
+// These do NOT take a property id and do NOT filter by entitlement — see the entitlement note on this
+// file. The property-scoped GetProperties and GetProperty are the paths that filter.
+//
+// GetProperty is NOT one of these despite its shape: it takes a property id and it filters, so it lives
+// with GetProperties above.
+// ---------------------------------------------------------------------------------------------------
+
+// Request for GetRoomType.
+message GetRoomTypeRequest {
+
+  // Room type to fetch, from `RoomTypeOffers.room_type_id` on a pricing result.
+  string room_type_id = 1;
+
+  // ISO 639-1 language for descriptions, e.g. "th". English is ALWAYS returned alongside it.
+  string language_code = 2;
+
+  // Cap on images and videos returned. Zero means no cap, which is the default.
+  int32 max_media = 3;
+
+  // IANA media type for image delivery URLs: image/jpeg (the default), image/png, image/webp, or image/*
+  // to let the CDN negotiate per client from its Accept header. Empty means image/jpeg.
+  //
+  // An unrecognised value is rejected with INVALID_ARGUMENT rather than quietly falling back, so a typo
+  // like "image/jpg" (not a media type) fails loudly instead of serving you JPEG while you believe you
+  // asked for something else. Whatever is served is echoed back on `MediaUrlVariant.format`.
+  string image_format = 4;
+
+  // IANA media type for the PLAYABLE video delivery URLs, `stream` and `preview`: video/mp4 (the
+  // default) or video/webm. Empty means video/mp4.
+  //
+  // This does NOT affect `poster` and `thumbnail`. Those are still frames extracted from the video, so
+  // they are images and follow `image_format`. An unrecognised value is rejected with INVALID_ARGUMENT.
+  string video_format = 5;
+}
+
+// Response for GetRoomType.
+message GetRoomTypeResponse {
+
+  // The room type.
+  RoomTypeContent room_type = 1;
+}
+
+// Request for GetRatePlan.
+//
+// No `language_code`: a rate plan carries a single untranslated `name` and no descriptions, so there would
+// be nothing for it to select. Accepting one anyway would imply a translation that never arrives.
+message GetRatePlanRequest {
+
+  // Rate plan to fetch, from `RoomRate.rate_plan_id` on a pricing result.
+  string rate_plan_id = 1;
+}
+
+// Response for GetRatePlan.
+message GetRatePlanResponse {
+
+  // The rate plan.
+  RatePlanContent rate_plan = 1;
+}
+
+// Request for GetCancellationPolicy.
+//
+// No `language_code`: a policy is a set of rules with no stored prose to translate. See
+// CancellationPolicyContent.
+message GetCancellationPolicyRequest {
+
+  // Cancellation policy to fetch, from `RoomRate.cancellation_policy_id` on a pricing result.
+  string cancellation_policy_id = 1;
+}
+
+// Response for GetCancellationPolicy.
+message GetCancellationPolicyResponse {
+
+  // The cancellation policy.
+  CancellationPolicyContent cancellation_policy = 1;
+}
+
+// Everything requested about one property.
+//
+// Populated fields depend on the `include` scopes you asked for. A scope you did not request is absent, not
+// empty — proto3 cannot distinguish "no restaurants" from "restaurants not requested" on a repeated field,
+// so check `included_scopes` rather than inferring from an empty list.
+message PropertyContent {
+
+  // The property this entry describes.
+  string property_id = 1;
+
+  // Whether content was returned, and if not, why.
+  ContentStatus status = 2;
+
+  // Version covering ALL static content for this property. The SAME value the pricing endpoints return on a
+  // search result as `last_update`. Store it with your cached copy; re-fetch when a search shows a different
+  // one. Present on CONTENT_STATUS_OK and CONTENT_STATUS_NOT_MODIFIED.
+  //
+  // This is about the PROPERTY, so it is comparable across surfaces — but for that same reason it says
+  // nothing about your channel, language or `include` set. To ask us whether your cached copy is current,
+  // send `cache_token` rather than this.
+  string content_version = 3;
+
+  // The scopes actually populated below. Echoed back so you can tell "not requested" from "none exist".
+  repeated ContentScope included_scopes = 4;
+
+  // Basic identity — always present when status is CONTENT_STATUS_OK.
+  PropertyBasics property = 5;
+
+  // Descriptions, address, policies, amenities and contacts. Present with CONTENT_SCOPE_PROPERTY_DETAILS.
+  PropertyDetails details = 6;
+
+  // On- and off-premises restaurants. Present with CONTENT_SCOPE_RESTAURANT.
+  repeated InventoryItemContent restaurants = 8;
+
+  // Spas. Present with CONTENT_SCOPE_SPA.
+  repeated InventoryItemContent spas = 9;
+
+  // Meeting rooms. Present with CONTENT_SCOPE_MEETING_ROOM.
+  repeated InventoryItemContent meeting_rooms = 10;
+
+  // Activities. Present with CONTENT_SCOPE_ACTIVITY.
+  repeated InventoryItemContent activities = 11;
+
+  // Attractions. Present with CONTENT_SCOPE_ATTRACTION.
+  repeated InventoryItemContent attractions = 12;
+
+  // Places of interest. Present with CONTENT_SCOPE_PLACE.
+  repeated InventoryItemContent places = 13;
+
+  // Purchasable add-ons. Present with CONTENT_SCOPE_ADD_ON.
+  repeated InventoryItemContent add_ons = 14;
+
+  // Cancellation policies referenced by `RoomRate.cancellation_policy_id`. Present with
+  // CONTENT_SCOPE_CANCELLATION_POLICY.
+  repeated CancellationPolicyContent cancellation_policies = 15;
+
+  // Perks referenced by `RoomRate.perk_ids`. Present with CONTENT_SCOPE_PERK.
+  repeated PerkContent perks = 16;
+
+  // Room types the property sells, ONCE each — not repeated per rate. Present when you request
+  // CONTENT_SCOPE_ROOM_TYPE. `RoomTypeOffers.room_type_id` on the pricing surfaces points here.
+  repeated RoomTypeContent room_types = 17;
+
+  // Rate plans, ONCE each — not repeated per rate. Present when you request CONTENT_SCOPE_RATE_PLAN.
+  // `RoomRate.rate_plan_id` on the pricing surfaces points here.
+  repeated RatePlanContent rate_plans = 18;
+
+
+  // How many of each ancillary entity this property has. ALWAYS present, whatever you included, and the
+  // reason the default response is useful on its own: it tells you which scopes are worth requesting for
+  // this property before paying for the round trip. A zero means the property has none, which is
+  // information — an empty `restaurants` list would not distinguish that from "you did not ask".
+  PropertyCounts counts = 19;
+
+  // Opaque token identifying THIS response for THIS property. Store it and send it back in
+  // `known_versions` to skip re-fetching content that has not changed. Present on CONTENT_STATUS_OK and
+  // CONTENT_STATUS_NOT_MODIFIED.
+  //
+  // Unlike `content_version`, this covers the request as well as the property: your sales channel,
+  // `language_code`, `include` and `max_media_per_entity` all feed it. Two callers holding the same property
+  // at the same version will hold different tokens if they asked different questions, which is why the token
+  // is per-response and the version is per-property.
+  //
+  // Treat it as bytes. It is not a timestamp, not a hash you should reproduce, and its format may change
+  // without notice — a token we no longer recognise simply yields a full response, never an error.
+  string cache_token = 20;
+}
+
+// How many ancillary entities a property has, per kind.
+//
+// Cheap to produce — these are stored counts on the property aggregate, not a count of loaded entities —
+// so they come back on every response regardless of `include`. Use them to decide which CONTENT_SCOPE
+// values are worth asking for: requesting CONTENT_SCOPE_SPA for a property with zero spas costs a round
+// trip and returns an empty list.
+message PropertyCounts {
+
+  // Restaurants on and off the premises.
+  int32 restaurants = 1;
+
+  // Spas.
+  int32 spas = 2;
+
+  // Meeting and event rooms.
+  int32 meeting_rooms = 3;
+
+  // Activities.
+  int32 activities = 4;
+
+  // Attractions.
+  int32 attractions = 5;
+
+  // Places of interest.
+  int32 places = 6;
+
+  // Purchasable add-ons.
+  int32 add_ons = 7;
+}
+
+// Which content to return.
+enum ContentScope {
+
+  // Not set; ignored.
+  CONTENT_SCOPE_UNSPECIFIED = 0;
+
+  // Descriptions, address, check-in/out policy, amenity and accessibility codes, contacts, categories.
+  CONTENT_SCOPE_PROPERTY_DETAILS = 1;
+
+  // Restaurants on and off the premises.
+  CONTENT_SCOPE_RESTAURANT = 3;
+
+  // Spas.
+  CONTENT_SCOPE_SPA = 4;
+
+  // Meeting and event rooms.
+  CONTENT_SCOPE_MEETING_ROOM = 5;
+
+  // Activities.
+  CONTENT_SCOPE_ACTIVITY = 6;
+
+  // Attractions.
+  CONTENT_SCOPE_ATTRACTION = 7;
+
+  // Places of interest.
+  CONTENT_SCOPE_PLACE = 8;
+
+  // Purchasable add-ons.
+  CONTENT_SCOPE_ADD_ON = 9;
+
+  // Cancellation policies and their deadlines.
+  CONTENT_SCOPE_CANCELLATION_POLICY = 10;
+
+  // Perks and their descriptions.
+  CONTENT_SCOPE_PERK = 11;
+
+  // Room types the property sells, once each. Join from `RoomTypeOffers.room_type_id`.
+  CONTENT_SCOPE_ROOM_TYPE = 12;
+
+  // Rate plans and their meal inclusions and terms, once each. Join from `RoomRate.rate_plan_id`.
+  CONTENT_SCOPE_RATE_PLAN = 13;
+}
+
+// Whether a property's content could be returned.
+//
+// There is no "not entitled" member, and its absence is deliberate. Content is not gated on your sales
+// channel — every property we hold is described to you. What your channel determines is which BOOKABLE
+// inventory comes back: `room_types`, `rate_plans`, `cancellation_policies` and `perks` are derived from
+// the master rates your channel carries, so a property you cannot sell returns CONTENT_STATUS_OK with its
+// descriptions, address and galleries, and empty bookable collections. That is a normal answer, not an
+// error — you are looking at a property you cannot currently sell, and `counts` still tells you what it
+// has.
+enum ContentStatus {
+
+  // Not set.
+  CONTENT_STATUS_UNSPECIFIED = 0;
+
+  // Content returned.
+  CONTENT_STATUS_OK = 1;
+
+  // No property with that identifier.
+  CONTENT_STATUS_NOT_FOUND = 2;
+
+  // Your cached copy is still current — you sent a matching `cache_token` in `known_versions`.
+  //
+  // `content_version` and `cache_token` come back; every other field is absent, INCLUDING `counts` and
+  // `included_scopes`. Absent here means "unchanged, look at what you stored", not "empty" — do not
+  // overwrite your cache from this entry, and do not read `included_scopes` as the scopes narrowing to none.
+  // The token echoed back is the one to store for next time.
+  //
+  // You will only ever see this for a property whose token you supplied. It costs the same as any other
+  // entry: billing is per call.
+  CONTENT_STATUS_NOT_MODIFIED = 3;
+}
+
+// A property's basic identity — the same fields a search result carries.
+message PropertyBasics {
+
+  // Stable property identifier.
+  string property_id = 1;
+
+  // Url-safe slug.
+  string url_name = 2;
+
+  // Property name in the requested language.
+  string name = 3;
+
+  // Property name in its local language, when it differs.
+  string local_name = 4;
+
+  // Where the property is.
+  //
+  // Bare latitude and longitude, not GeoJSON: this field carries only coordinates, and the surrounding
+  // JSON already tells you what kind of thing they belong to.
+  GeoPosition geo_location = 5;
+
+  // Official star rating, 1-5. Zero when unrated.
+  int32 star_rating = 6;
+
+  // Published property images, lowest `sort` first. Capped by `max_media_per_entity` when you set one.
+  // Unpublished assets are never returned — a property that took an image down did so deliberately.
+  repeated Multimedia images = 7;
+
+  // Published property videos, same ordering and cap as `images`.
+  repeated Multimedia videos = 8;
+
+  // ISO 4217 currency the property trades in.
+  string currency_code = 9;
+
+  // Total rooms at the property.
+  int32 number_of_rooms = 10;
+
+  // The city this property is in, with the identifiers the destination surfaces take.
+  //
+  // Here rather than on PropertyDetails so that it arrives on every successful Content call, whatever
+  // scopes you asked for: pivoting from a property to its city should not require paying for the full
+  // details scope. Absent when the property has no city on record.
+  City city = 11;
+}
+
+// Everything else about the property itself.
+message PropertyDetails {
+
+  // Localized descriptions, in English plus your requested language.
+  repeated Description descriptions = 1;
+
+  // Postal address.
+  Address address = 2;
+
+  // Property chain, when the property belongs to one.
+  string chain = 3;
+
+  // Brand within the chain.
+  string brand = 4;
+
+  // Setting, e.g. beachfront or city centre.
+  string location_category = 5;
+
+  // Market segment, e.g. luxury or economy.
+  string segment_category = 6;
+
+  // Property type, e.g. property, hostel or resort.
+  string property_category = 7;
+
+  // Architectural style, when recorded.
+  string architectural_style = 8;
+
+  // Year or period built, when recorded.
+  string when_built = 9;
+
+  // Lifestyles this property is oriented toward.
+  repeated LifestyleType lifestyle_types = 10;
+
+  // Check-in, check-out, children and pet rules.
+  PropertyPolicy policy = 11;
+
+  // OpenTravel HAC (Hotel Amenity) codes. Look codes up at https://wink.travel/developers/taxonomy.
+  repeated string ota_hac_amenity_codes = 12;
+
+  // OpenTravel PHY (Accessibility Feature) codes.
+  repeated string ota_phy_accessibility_codes = 13;
+
+  // OpenTravel SEC (Security Feature) codes.
+  repeated string ota_sec_security_codes = 14;
+
+  // Mean guest review rating.
+  float aggregate_review_rating = 15;
+
+  // Number of guest reviews behind the rating.
+  int32 total_reviews = 16;
+
+  // Wink sustainability rating.
+  float aggregate_greendex_rating = 17;
+}
+
+// Check-in, check-out and house rules.
+message PropertyPolicy {
+
+  // Local check-in time, "HH:mm".
+  string check_in_time = 1;
+
+  // Local check-out time, "HH:mm".
+  string check_out_time = 2;
+
+  // Whether children are accepted.
+  bool children_allowed = 3;
+
+  // Minimum age accepted, when the property sets one.
+  int32 children_minimum_age = 4;
+
+  // Whether pets are accepted.
+  bool pets_allowed = 5;
+
+  // Maximum pet weight in kilograms, when limited.
+  double pet_max_weight_in_kilos = 6;
+
+  // How internet is provided, e.g. wired or wireless.
+  string internet_connection_type = 7;
+
+  // Where internet is available, e.g. in-room or public areas.
+  string internet_connection_location = 8;
+
+  // Whether internet is free or paid.
+  string internet_availability = 9;
+
+  // Whether parking is free, paid or unavailable.
+  string parking_availability = 10;
+
+  // How parking is accessed, e.g. valet or self.
+  string parking_access = 11;
+}
+
+// CHANNEL SCOPING for the bookable collections. NOT an access-control gate.
+//
+// Content itself is open to any authenticated caller: descriptions, addresses, galleries and counts come
+// back for every property we hold. There is no NOT_ENTITLED status and no 403 path. This service exists to
+// help a traveller book, and hiding a property's description from an integrator serves nobody.
+//
+// What IS channel-scoped is what can be SOLD. A master rate is the unit of sellable inventory, and the
+// `inventory` collection is where a sales channel's master rates are recorded: a GUEST_ROOM row's
+// `inventoryIdentifier` is a MASTER RATE id (NOT a room type id — that mistake yields an empty intersection
+// with no error; see PropertyContentProjector). So `room_types`, `rate_plans`, `cancellation_policies` and
+// `perks` are derived from the master rates the caller's channel carries, and the ancillary collections
+// from that channel's rows of the matching InventoryType.
+//
+// A caller whose channel carries nothing for a property therefore gets CONTENT_STATUS_OK, full static
+// content, and empty bookable collections. That is the honest answer: the property exists and is described,
+// and you cannot currently sell any of it.
+//
+// The BY-ID lookups take no property id and apply no channel scoping at all — an id only reaches a caller
+// through their own priced results, and the entity behind it is static content.
+
+// A bookable room type. Returned once per property in `PropertyContent.room_types`, never inline on a
+// rate; `RoomTypeOffers.room_type_id` points here. Only room types reachable from a master rate you can
+// see are ever returned by a property-scoped call.
+message RoomTypeContent {
+
+  // Stable room type identifier. Matches `RoomPrice.room_type_id` on the pricing endpoints, which you can
+  // use to group several rates for the same room.
+  string id = 1;
+
+  // Room name in the requested language.
+  string name = 2;
+
+  // Localized descriptions, in English plus your requested language.
+  repeated Description descriptions = 3;
+
+  // Room images and videos.
+  repeated Multimedia multimedias = 4;
+
+  // Display order within the property, ascending.
+  int32 sort = 5;
+
+  // Total guests, adults plus children.
+  int32 max_occupancy = 6;
+
+  // Minimum guests required.
+  int32 min_occupancy = 7;
+
+  // Maximum adults.
+  int32 max_adult_occupancy = 8;
+
+  // Maximum children.
+  int32 max_child_occupancy = 9;
+
+  // Rooms of this type at the property.
+  int32 quantity = 10;
+
+  // Floor area in square metres.
+  double size = 11;
+
+  // Whether the room is non-smoking.
+  bool non_smoking = 12;
+
+  // OpenTravel SEG (Segment Category) code, e.g. "4" = Deluxe, "16" = Standard. Look codes up at
+  // https://wink.travel/developers/taxonomy.
+  string ota_seg_room_category = 13;
+
+  // OpenTravel RVT (Room View Type) code, e.g. "11" = Ocean view, "16" = Garden view.
+  string ota_rvt_room_view_code = 14;
+
+  // OpenTravel RMA (Room Amenity) codes, e.g. "2" = Air conditioning, "7" = Balcony.
+  repeated string ota_rma_amenities = 15;
+
+  // OpenTravel PHY (Accessibility Feature) codes, e.g. "110" = Roll-in shower available.
+  repeated string ota_phy_accessibility_features = 17;
+
+  // OpenTravel RLT (Room Location Type) code, e.g. "1" = Away from elevator, "8" = High floor.
+  string ota_rlt_room_location_code = 18;
+
+  // OpenTravel GRI (Guest Room Info) code, e.g. "44" = Bungalow, "45" = Villa, "82" = Standard.
+  string ota_gri_room_classification_code = 19;
+
+  // OpenTravel ARC (Architectural Style) code, e.g. "7" = Modern, "11" = Victorian.
+  string ota_arc_room_architecture_code = 20;
+
+  // The bed layouts this room can be booked in, each with a stable id.
+  //
+  // Pass the id of the one the guest chose as `BookingRoomRequest.bedroom_configuration_id`. A room with
+  // one layout still returns it; send the id anyway rather than relying on the default, which is
+  // "whichever the property happens to list first".
+  repeated BedConfiguration bed_configurations = 21;
+
+  // 16 held `repeated string bed_configuration` — layout NAMES with no ids, which no caller could use to
+  // book a specific layout. Reserved rather than retyped in place so the tag cannot be reused for an
+  // unrelated meaning and silently reinterpret an old capture.
+  reserved 16;
+  reserved "bed_configuration";
+}
+
+// One bookable bed layout for a room type.
+//
+// Suppliers routinely put an entire room description in `name` ("Suite - 1 Bedroom, 1 Double Bed,
+// Non-Smoking, Balcony…"), so render from `bedrooms` when you want to show what a guest actually gets.
+// Wink's own booking confirmations stopped trusting `name` for exactly that reason.
+message BedConfiguration {
+
+  // Stable identifier for this layout. THIS is what `BookingRoomRequest.bedroom_configuration_id` wants.
+  string id = 1;
+
+  // The property's own label for the layout, e.g. "Master Bedroom". Untranslated, and frequently verbose.
+  string name = 2;
+
+  // The bedrooms in this layout, and the beds in each.
+  repeated Bedroom bedrooms = 3;
+}
+
+// One bedroom within a layout.
+message Bedroom {
+
+  // Which bedroom this is within the layout.
+  BedroomType type = 1;
+
+  // The beds in this bedroom.
+  repeated Bed beds = 2;
+}
+
+// A quantity of one bed type.
+message Bed {
+
+  // OpenTravel BED (Bed Type) code, e.g. "3" = King, "5" = Queen, "8" = Twin. Look codes up at
+  // https://wink.travel/developers/taxonomy.
+  string ota_bed_type_code = 1;
+
+  // How many beds of this type, at least one.
+  int32 quantity = 2;
+}
+
+// Which bedroom a Bedroom is within its layout.
+enum BedroomType {
+
+  // Not set.
+  BEDROOM_TYPE_UNSPECIFIED = 0;
+
+  // The principal bedroom.
+  BEDROOM_TYPE_MASTER = 1;
+
+  // A queen bedroom.
+  BEDROOM_TYPE_QUEEN = 2;
+
+  // A junior bedroom.
+  BEDROOM_TYPE_JUNIOR = 3;
+
+  // A shared dormitory. Typically hostels.
+  BEDROOM_TYPE_DORMITORY = 4;
+
+  // Numbered bedrooms, for layouts that simply count them.
+  BEDROOM_TYPE_BEDROOM_1 = 5;
+  BEDROOM_TYPE_BEDROOM_2 = 6;
+  BEDROOM_TYPE_BEDROOM_3 = 7;
+  BEDROOM_TYPE_BEDROOM_4 = 8;
+  BEDROOM_TYPE_BEDROOM_5 = 9;
+  BEDROOM_TYPE_BEDROOM_6 = 10;
+  BEDROOM_TYPE_BEDROOM_7 = 11;
+  BEDROOM_TYPE_BEDROOM_8 = 12;
+  BEDROOM_TYPE_BEDROOM_9 = 13;
+  BEDROOM_TYPE_BEDROOM_10 = 14;
+}
+
+// A non-room inventory item: restaurant, spa, meeting room, activity, attraction, place or add-on.
+//
+// These share a shape deliberately. They differ in what they mean, not in what they carry, and one message
+// keeps the contract small and lets a client render any of them with the same code. Where a type needs
+// fields the others do not, those arrive as new field numbers on this message rather than a new message.
+message InventoryItemContent {
+
+  // Stable identifier for this item.
+  string id = 1;
+
+  // Item name in the requested language.
+  string name = 2;
+
+  // Localized descriptions, in English plus your requested language.
+  repeated Description descriptions = 3;
+
+  // Images and videos.
+  repeated Multimedia multimedias = 4;
+
+  // Display order within its collection, ascending.
+  int32 sort = 5;
+
+  // Whether the item is on the property's premises.
+  bool on_premises = 6;
+
+  // Where the item is, when it differs from the property.
+  //
+  // Bare latitude and longitude, not GeoJSON. Absent, not zeroed, when the item sits at the property --
+  // see `PartnerContentContractMeasurementTest` for how that absence is verified rather than assumed.
+  GeoPosition geo_location = 7;
+
+  // Postal address, when the item has its own.
+  Address address = 8;
+
+  // The lifestyle this item suits, when tagged. Singular, not a list: the platform records exactly one
+  // per item.
+  LifestyleType lifestyle_type = 9;
+
+  // OpenTravel RSI (Restaurant Service/Amenity) codes. Populated only for `restaurants`.
+  repeated string ota_rsi_amenities = 11;
+
+  // OpenTravel SPA (Spa Feature) codes. Populated only for `spas`.
+  repeated string ota_spa_amenities = 12;
+
+  // OpenTravel MRC (Meeting Room Code) codes. Populated only for `meeting_rooms`.
+  repeated string ota_mrc_amenities = 13;
+
+  // OpenTravel REC (Recreation) codes. Populated only for `activities`.
+  repeated string ota_rec_amenities = 14;
+
+  // OpenTravel PRX (Proximity) code, e.g. "1" = On premises, "3" = Nearby. Five values, so do NOT read
+  // it as a boolean -- `on_premises` above is the two-way answer if that is all you need.
+  string ota_prx_proximity_code = 15;
+
+  // OpenTravel AQC (Age Qualifying) code, e.g. "3" = Under 2, "8" = Child, "1" = Over 21. An age
+  // CATEGORY, not a numeric minimum age -- parsing it as a number yields nonsense for most values.
+  string ota_aqc_min_age_appropriate_code = 16;
+
+  // OpenTravel SEC (Security Feature) codes.
+  repeated string ota_sec_security_features = 17;
+
+  // OpenTravel PHY (Accessibility Feature) codes.
+  repeated string ota_phy_accessibility_features = 18;
+
+  // 10 held a single `repeated string amenities` that flattened FOUR different OpenTravel code tables
+  // together — restaurants used RSI, spas SPA, meeting rooms MRC, activities REC — so a caller could not
+  // tell which table to look a value up in. Split into one field per table above; exactly one is ever
+  // populated, decided by which PropertyContent collection the item came back in. Attractions, places and
+  // add-ons record no amenities at all and populate none of them.
+  reserved 10;
+  reserved "amenities";
+}
+
+// A rate plan and what it includes. Returned once per property in `PropertyContent.rate_plans`, never
+// inline on a rate; `RoomRate.rate_plan_id` points here. Only rate plans reachable from a master rate you
+// can see are ever returned by a property-scoped call.
+//
+// A rate plan has no localized descriptions — `name` is a single untranslated label the property chose,
+// and `language_code` on your request does not affect it. What a rate plan actually carries is what it
+// INCLUDES, which is the meal booleans below.
+message RatePlanContent {
+
+  // Stable rate plan identifier. Matches `RoomRate.rate_plan_id` on the pricing endpoints.
+  string id = 1;
+
+  // Rate plan name as the property wrote it, e.g. "Best Available Rate". Untranslated.
+  string name = 2;
+
+  // Whether the rate must be paid in full at booking rather than at the property.
+  bool prepaid = 3;
+
+  // Breakfast is included in the rate.
+  bool breakfast = 4;
+
+  // Brunch is included in the rate.
+  bool brunch = 5;
+
+  // Lunch is included in the rate.
+  bool lunch = 6;
+
+  // Dinner is included in the rate.
+  bool dinner = 7;
+
+  // Everything is included except alcohol.
+  bool all_inclusive = 8;
+
+  // Everything is included, alcohol as well.
+  bool all_inclusive_plus_alcohol = 9;
+
+  // The cancellation policy governing this rate plan, when it sets one. Join to
+  // `PropertyContent.cancellation_policies` or fetch it with GetCancellationPolicy.
+  string cancellation_policy_id = 10;
+}
+
+// A cancellation policy: the deadline, and what is charged on each side of it.
+//
+// Join to a pricing result through `RoomRate.cancellation_policy_id`. The pricing surface already tells you
+// whether a rate is refundable and until when; this tells you the terms behind that answer.
+//
+// A policy has no name and no descriptions — it is a set of rules, not prose, and the platform stores no
+// localized text for one. Render it from the fields below; `policy_code` is the short label to show when
+// you have room for two characters and not a sentence.
+//
+// The charge fields are enum NAMES, not free text, and the set of names is stable. Treat an unrecognised
+// value as "charge applies, terms unknown" rather than as an error: new members are added to these ladders
+// over time and an unknown one must not break your rendering.
+message CancellationPolicyContent {
+
+  // Stable policy identifier.
+  string id = 1;
+
+  // Whether the stay can be cancelled without charge before the deadline. The single field to branch on.
+  bool refundable = 2;
+
+  // Two-character summary: "R" refundable, "NR" non-refundable.
+  string policy_code = 3;
+
+  // Days before arrival by which a free cancellation must be made. Zero means the deadline falls ON the
+  // arrival day — read `advance_cancellation_free_of_charge` for the hour, which is the only place that
+  // distinction survives. Absent on a non-refundable policy, which has no free window to count down.
+  int32 free_cancellation_days_before = 4;
+
+  // The free-cancellation window as the property set it, e.g. "SEVEN_DAYS_BEFORE_ARRIVAL" or
+  // "UNTIL_EIGHTEEN_HUNDRED_HOURS_ON_DAY_OF_ARRIVAL". The two day-of-arrival values both report
+  // `free_cancellation_days_before` = 0 and differ only here.
+  string advance_cancellation_free_of_charge = 5;
+
+  // What a refundable policy charges when the free window has closed, e.g. "FIFTY_PERCENT".
+  string refundable_cancellation_charge = 6;
+
+  // What is charged when the guest does not arrive at all, e.g. "SAME_AS_CANCELLATION_FEE".
+  string no_show_charge = 7;
+
+  // What a non-refundable policy charges on cancellation, e.g. "SEVENTY_PERCENT".
+  string non_refundable_cancellation_charge = 8;
+
+  // The point after which a non-refundable policy charges more, e.g. "SEVEN_DAYS_BEFORE_ARRIVAL".
+  string non_refundable_deadline = 9;
+
+  // What a non-refundable policy charges once `non_refundable_deadline` has passed, e.g.
+  // "ONE_HUNDRED_PERCENT".
+  string non_refundable_after_deadline_cancellation_charge = 10;
+}
+
