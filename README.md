@@ -42,24 +42,24 @@ deliberate and permanent: the name is part of the gRPC method path clients route
 
 This repo carries **only** the `.proto` source files — no generated language stubs. Generate your
 own client with [`buf`](https://buf.build/docs/introduction) or `protoc` in whatever language you
-need. The contracts depend on the standard [`googleapis`](https://buf.build/googleapis/googleapis)
-common types (`google.api.http`, `google.api.annotations`, `google.type.*`), declared as a
-[`buf.yaml`](buf.yaml) dependency rather than vendored.
+need. The contracts are self-contained — the only `import` anywhere in the tree is
+`wink/partner/v1/partner_common.proto`, which lives in this repo — so there is nothing external to
+fetch and nothing extra to put on your include path.
 
 ```bash
-# using buf (recommended) — resolves the googleapis dependency for you
+# using buf (recommended)
 buf generate --template buf.gen.yaml   # bring your own buf.gen.yaml for your target language
 
-# using protoc directly — you must supply googleapis yourself on the include path
-protoc -I proto -I path/to/googleapis --java_out=out \
-  $(find proto -name '*.proto')
+# using protoc directly; protoc does not create its output directory
+mkdir -p out
+protoc -I proto --java_out=out $(find proto -name '*.proto')
 ```
 
-Pin to a tag rather than tracking `master`, so a later release can't change your generated stubs
-out from under you:
+Pin to a released tag rather than tracking `master`, so a later release can't change your generated
+stubs out from under you. Use the newest tag from [Releases](../../releases):
 
 ```bash
-git clone --branch v1.0.0 --depth 1 https://github.com/wink-travel/partner-api-proto.git
+git clone --branch <tag> --depth 1 https://github.com/wink-travel/partner-api-proto.git
 ```
 
 ## Human-readable API reference
