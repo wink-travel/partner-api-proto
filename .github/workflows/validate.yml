@@ -18,26 +18,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # Full history + tags: the breaking check below resolves the previous release tag out of
+          # the local clone (.git#tag=...), so a shallow checkout would leave it nothing to compare
+          # against.
           fetch-depth: 0
 
       - uses: bufbuild/buf-setup-action@v1
 
       - name: buf lint
-        run: |
-          # Pre-release, proto/ holds only README.md and buf fails the module outright with
-          # "had no .proto files" — which would make every docs/CI PR here red for a reason that
-          # has nothing to do with the PR. Once the first release publishes, this guard is inert.
-          if ! find proto -name '*.proto' -type f | grep -q .; then
-            echo "No .proto files published yet — skipping lint."
-            exit 0
-          fi
-          buf lint
+        run: buf lint
 
       - name: buf breaking (against previous release tag)
         run: |
-          PREV_TAG=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
-          if [ -z "$PREV_TAG" ]; then
-            echo "No previous release tag yet — skipping breaking check."
-            exit 0
-          fi
+          set -euo pipefail
+          PREV_TAG=$(git describe --tags --abbrev=0 --match 'v*')
+          echo "Comparing against ${PREV_TAG}."
           buf breaking --against ".git#tag=${PREV_TAG}"
