@@ -9,6 +9,14 @@ in `monorepo-java` when it cuts a release; do not hand-edit past entries.
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-09-08
+
+Released from `monorepo-java` 33ba42254b62.
+
+### Fixed
+
+- correct the day-of-week on the taxonomy and booking `Sunset` headers
+
 ## [1.0.0] — 2026-09-02
 
 Released from `monorepo-java` 55caee3152e0.

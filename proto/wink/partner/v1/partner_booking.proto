@@ -15,7 +15,7 @@ option java_outer_classname = "PartnerBookingProto";
 // `leading_detached_comments`; GrpcOpenApiGenerator reads only `leading_comments`.
 //
 // REPLACES the REST AgentBookingController (booking/booking-web). Those seven endpoints are deprecated
-// with `Sunset: Wed, 01 Oct 2026`, matching the reference-data retirement in 0ae7b5be7e.
+// with `Sunset: Thu, 01 Oct 2026`, matching the reference-data retirement in 0ae7b5be7e.
 //
 // NOT METERED, deliberately, and that is a decision rather than an oversight. booking-domain carries no
 // @Metered, so this surface stays free while it sits in a document branded as the paid Partner Integrator
