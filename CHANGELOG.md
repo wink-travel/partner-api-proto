@@ -9,6 +9,15 @@ in `monorepo-java` when it cuts a release; do not hand-edit past entries.
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-09-14
+
+Released from `monorepo-java` 5407b4b75e9d.
+
+### Added
+
+- expose feeModel/acquiringFee/refundFee on BookingLightweight, LedgerBalanceResponse.withdrawable, property email Stripe fee rows
+
+
 ## [1.0.1] — 2026-09-08
 
 Released from `monorepo-java` 33ba42254b62.

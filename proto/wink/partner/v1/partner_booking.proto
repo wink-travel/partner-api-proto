@@ -57,6 +57,7 @@ option java_outer_classname = "PartnerBookingProto";
 //   original_supplier_agency_fees_in_percent            the SUPPLIER's cut
 //   total_platform_fee_in_percent(_with_refund)         Wink's cut
 //   total_payment_processing_fee_in_percent(...)        processor economics
+//   fee_model, acquiring_fee, refund_fee                processor economics, the supplier's cost
 //   financial_breakdown                                 per-beneficiary, includes supplier and platform
 //   user_session                                        the traveller's browsing session
 //   socials, email_header_logo_url, logo_identifier, property_image_url, static_map_*   email presentation

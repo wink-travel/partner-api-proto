@@ -1,6 +1,6 @@
 {
-  "monorepo_java_commit": "33ba42254b62478b728dbc75148cbbb66a46f205",
-  "proto_commit": "bf838180217fd86f73980c82e38b467c54dc7f02",
-  "last_published_at": "2026-09-08T08:49:07Z",
-  "version": "1.0.1"
+  "monorepo_java_commit": "5407b4b75e9dea498930208ab8becda63c72a023",
+  "proto_commit": "0960e0a415061ec5d6cc611f25f41a68b60f6f66",
+  "last_published_at": "2026-09-14T16:37:30Z",
+  "version": "1.1.0"
 }
