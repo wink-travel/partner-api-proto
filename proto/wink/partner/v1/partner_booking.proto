@@ -58,6 +58,9 @@ option java_outer_classname = "PartnerBookingProto";
 //   total_platform_fee_in_percent(_with_refund)         Wink's cut
 //   total_payment_processing_fee_in_percent(...)        processor economics
 //   fee_model, acquiring_fee, refund_fee                processor economics, the supplier's cost
+//                                                       (the ONE processor figure published is the Payment Collection Fee
+//                                                       applied to the agency's own commission, as AgentEarnings.
+//                                                       payment_collection_fee_amount — Partner Payment Terms 2.2)
 //   financial_breakdown                                 per-beneficiary, includes supplier and platform
 //   user_session                                        the traveller's browsing session
 //   socials, email_header_logo_url, logo_identifier, property_image_url, static_map_*   email presentation
@@ -298,8 +301,10 @@ message BookingPerson {
 // What this booking is worth to the agency.
 //
 // The agency's OWN economics only. The platform's fee, the supplier's agency fee and the payment
-// processor's cut are all deliberately absent — they are somebody else's commercial terms and publishing
-// them here would make them a contract we cannot change.
+// processor's own economics are deliberately absent — they are somebody else's commercial terms and
+// publishing them here would make them a contract we cannot change. The one exception is the Payment
+// Collection Fee that reduced THIS agency's commission (`payment_collection_fee_amount`), published
+// because the agency's commission is computed after it and must be reconcilable.
 message AgentEarnings {
 
   // Net sale value in `currency_code`, summed across SALE-type beneficiaries.
@@ -316,12 +321,42 @@ message AgentEarnings {
   // amounts because that is how they are agreed and how they survive a partial refund.
   string commission_percent = 3;
 
-  // The agency's own agency-fee percentage at booking time.
+  // The agency-fee percentage at booking time: the share of the gross commission that goes to the
+  // agency-fee beneficiary rather than to this agency. It is a share of the COMMISSION, not of the booking
+  // value. When it is set, this agency keeps (1 - agency_fee_percent) of the commission.
   string agency_fee_percent = 4;
 
   // Commission percentage restated after any refund. Equal to `commission_percent` until something is
   // refunded, and the value to reconcile against once something is.
   string commission_percent_after_refund = 5;
+
+  // The agency's commission on this booking as an AMOUNT in `commission_currency_code` (the currency the
+  // agency is credited and paid in, which is NOT `currency_code`), after the Payment Collection Fee has been
+  // applied to the commission base:
+  //   commission_percent x (1 - agency_fee_percent) x (booking value - platform fee - payment_collection_fee_amount)
+  // after any refund, where (1 - agency_fee_percent) is 1 when there is no agency-fee beneficiary. This is the
+  // figure the agency is actually credited.
+  //
+  // Absent when the booking carries no commission for this agency (self-managed or 0% commission), which
+  // is different from a commission of zero. `commission_percent` and `commission_percent_after_refund`
+  // stay the contract rate and are NOT restated to reflect the fee.
+  optional int64 commission_amount = 6;
+
+  // The Payment Collection Fee applied to this booking's commission base, in `commission_currency_code`. It is the
+  // payment provider's actual cost of collecting this booking's payment, apportioned to this booking, and
+  // it reduces `commission_amount` by commission_percent x (1 - agency_fee_percent) x this value
+  // (Partner Payment Terms 2.2).
+  //
+  // Absent when no fee has been applied: bookings made before it was introduced, bookings priced under
+  // the fixed processing fee, bookings whose payment has not settled yet, self-managed agents (who acquire
+  // and disburse outside Wink), and bookings with no commission for this agency (0% commission), because
+  // there is no commission for the fee to have been applied to. Absent does not mean zero.
+  optional int64 payment_collection_fee_amount = 7;
+
+  // ISO 4217 code of `commission_amount` and `payment_collection_fee_amount`: the currency agencies are
+  // credited and paid in. Every other amount on this message is in `currency_code`, the property's
+  // settlement currency. Set whenever either of those two amounts is present; empty otherwise.
+  string commission_currency_code = 8;
 }
 
 // Why and when a booking was cancelled.
@@ -655,27 +690,37 @@ message BookingFee {
 //
 //   PROPERTY-LEVEL (restaurant, spa, meeting room, activity, attraction, place, add-on)
 //     inventory_id          AncillaryInventory.inventory_id          — the restaurant or spa itself
-//     channel_inventory_id  AncillaryInventory.channel_inventory_identifier
 //     offer_id              AncillaryOffer.id                        — the sitting, the 1-hour massage
 //     type                  AncillaryInventory.type
 //
+// For the six venue scopes (restaurant, spa, meeting room, activity, attraction, place) `inventory_id` already
+// names the venue, so it is the venue the extra is booked at and `venue_id` is only needed to override it. A
+// venue the offer is not sold at, or one that is inactive, fails the call with INVALID_ARGUMENT. For an add-on
+// `inventory_id` is never read as a venue: name the venue with `venue_id`.
+//
 //   IN-ROOM (INVENTORY_SCOPE_ROOM_TYPE_ANCILLARY)
 //     inventory_id          RoomRate.room_rate_id                    — the RATE, not a room type
-//     channel_inventory_id  leave blank — this is the common case and not an error
 //     offer_id              RoomRate.room_type_ancillaries[].id
 //     type                  INVENTORY_SCOPE_ROOM_TYPE_ANCILLARY
 //
 // The in-room case is the one to read twice: its `inventory_id` is a RATE because the gate for these is
 // keyed by the master rate rather than by an entity. Sending a room type id there matches nothing, and it
 // does so SILENTLY rather than failing.
+//
+// MANDATORY OFFERS are not yours to send. An `AncillaryOffer` with `mandatory = true` is added to every room
+// by the platform, at a quantity set by its `pricing_type`; an entry here for one is replaced, not summed. A
+// `venue_id` on such an entry is still honoured: it picks the venue the platform books the add-on at, and a venue
+// the offer is not sold at fails the call with INVALID_ARGUMENT. Naming DIFFERENT venues for the same mandatory
+// offer among one room's extras also fails with INVALID_ARGUMENT.
+//
+// You never name a sales channel. The platform resolves the channel `offer_id` is sold through for YOUR
+// account at this room's property — your own direct channel when the extra is on one, otherwise Wink
+// Network. An extra your account cannot sell at that property fails the whole call with
+// FAILED_PRECONDITION naming the `offer_id`; nothing is booked.
 message BookingAncillaryRequest {
 
   // The thing being sold from — see the table above. Never a room type.
   string inventory_id = 1;
-
-  // Your channel's gate onto it. Empty when the item reached you through Wink Network rather than one of
-  // your own sales channels, which is the common case and not an error.
-  string channel_inventory_id = 2;
 
   // The priced row you are buying.
   string offer_id = 3;
@@ -697,6 +742,19 @@ message BookingAncillaryRequest {
   // ISO-8601 local date-time at the property.
   string requested_start = 6;
   string requested_end = 7;
+
+  // OPTIONAL. Overrides the venue to book this offer at. For a venue-level extra (restaurant, spa, meeting room,
+  // activity, attraction, place) `inventory_id` already names the venue and is the default, so send `venue_id`
+  // only to book at a different one of the venues that sell the offer. For an add-on (property-level) extra
+  // `inventory_id` is never read as a venue: quote the `inventory_id` of the venue whose price list showed the
+  // offer here, and omit it when exactly one bookable venue sells the offer. A venue the offer is not sold at, or
+  // one that is inactive, fails the call with INVALID_ARGUMENT, and so does omitting it for an add-on that
+  // several venues sell. That last rule is for optional offers. For a MANDATORY offer (added by the platform) that
+  // names no venue (you sent no entry for it, or one that names none) the platform books the first bookable venue the add-on lists, or the first bookable venue of
+  // its category when it lists none.
+  // Ignored for in-room extras and for add-ons that are not sold at a specific venue (for example an
+  // airport transfer).
+  string venue_id = 8;
 }
 
 // Response for CreateBooking.

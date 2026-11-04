@@ -9,6 +9,41 @@ in `monorepo-java` when it cuts a release; do not hand-edit past entries.
 
 ## [Unreleased]
 
+## [2.0.0] — 2026-11-04
+
+Released from `monorepo-java` 13c8ceb7ec1e.
+
+### Breaking
+
+- publish source-currency amounts with display-only FX quotes (#1332)
+- share static content and paged reviews between the public and Partner APIs (#1317)
+- 7c-3 channelInventoryIdentifier leaves every public contract
+- remove channel_inventory_id from the Partner API; the server resolves the add-on's channel
+
+### Added
+
+- partner commission excludes the actual Payment Collection Fee
+- partner room-type rate calendar RPC
+- add SearchByFilters, SearchLatest and SearchBySavedList to the Partner Search API (#1356)
+- serve venue, contact, metadata and announcement fields on inventory/content (#1352)
+- add bathroomCount, securityFeatures and other guest room fields to ROOM_TYPE content (#1337)
+- bring back the ADD_ON content scope and link priced offers by addOnId (#1336)
+- sort search by a real price band instead of star rating (#1334)
+- optional recognitions and green index scores on public and Partner content (#1330)
+- apply an add-on to one, several or all items of its inventory type (#1267)
+- apply mandatory add-ons on every sales channel
+- phase 6 PR 2b — hotel search on PropertyAggregate
+
+### Changed
+
+- describe mandatory add-on quantity by hotel child-age policy
+
+### Fixed
+
+- degrade a property whose currency has no platform quote instead of failing the page (#1358)
+- list every perk on a master rate and deprecate the unpopulated Partner perks dictionary (#1325)
+- apply room type and rate plan restrictions to venue add-ons and at checkout (#1266)
+
 ## [1.1.0] — 2026-09-14
 
 Released from `monorepo-java` 5407b4b75e9d.

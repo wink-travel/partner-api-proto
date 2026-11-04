@@ -18,6 +18,7 @@ option java_outer_classname = "PartnerInventoryProto";
 //   GetPropertyInventory  <- POST /api/partner/{id}/inventory         (HotelInventoryRequest)
 //   ListPropertyInventory <- POST /api/partner/{id}/inventory/list    (HotelInventoryListRequest)
 //   GetRatePeriod         <- POST /api/partner/{id}/inventory/period  (PeriodForPropertyRequest)
+//   GetRoomTypeRatePeriod    has NO REST twin; it is metered like GetRatePeriod (INVENTORY_PERIOD).
 //
 // The billable account arrives as call metadata under `managing-entity-id`, never as a request
 // field — PartnerRequestConventionTest asserts that across every Partner proto. Tags number from 1 with no
@@ -47,7 +48,7 @@ option java_outer_classname = "PartnerInventoryProto";
 // changed. What was rejected was returning the ancillaries' STATIC halves — every restaurant's name,
 // gallery and opening hours, on a prices call, in a response nobody could cache. What ships instead is only
 // the priced rows plus `inventory_id`, opt-in per type. The static half is still Content's, still fetched
-// once, still cached against `last_update`. `AncillaryInventory` is six scalars and a list; the REST twin's
+// once, still cached against Content's `cache_token`. `AncillaryInventory` is six scalars and a list; the REST twin's
 // RestaurantLocalizedInventory embeds a whole RestaurantLightweight.
 //
 // The one deliberate exception is RoomTypeOffers.hero_image_url: one image URL per ROOM TYPE, because
@@ -62,8 +63,8 @@ option java_outer_classname = "PartnerInventoryProto";
 // What is left is the thing Inventory has that Search does not: EVERY priced offer for one known property,
 // rather than the best offer per room type.
 //
-// MONEY follows partner_search.proto — int64 minor units, with the currency and its exponent declared once
-// per response. See RoomRate there for the full convention.
+// MONEY follows partner_search.proto — int64 minor units, with the currency, its exponent and the exchange
+// rates declared once per property (`PropertyCurrency`). See RoomRate for the full convention.
 
 // Look up live prices for a property you already know — the paid Partner Inventory API.
 //
@@ -72,8 +73,9 @@ option java_outer_classname = "PartnerInventoryProto";
 // a date range.
 //
 // These endpoints return PRICES, not property content. Names, descriptions, galleries, addresses, amenities
-// and policies come from the Content service — call it once per property, cache the answer, and refresh when
-// `last_update` changes. That keeps these responses small and means property content has exactly one source
+// and policies come from the Content service — call it once per property, cache the answer, and refresh it by sending
+// the stored `cache_token` as `known_versions` (NOT_MODIFIED means it is current; `last_update` lags and does not
+// move for perk edits). That keeps these responses small and means property content has exactly one source
 // of truth.
 //
 // That split runs through the transactional inventory too. Ask for `INVENTORY_SCOPE_SPA` and you get the
@@ -84,7 +86,8 @@ option java_outer_classname = "PartnerInventoryProto";
 // Every call needs an authenticated token with `INVENTORY:READ` on the account you name in the
 // `managing-entity-id` metadata header, and is billed in hotel-day units.
 //
-// Prices are live and are not cached. Treat a result as valid for the length of a user's session.
+// Prices come from a short-lived cache (up to 120 seconds for the rate calendars), so a result can be slightly
+// behind a very recent rate change. Treat a result as valid for the length of a user's session.
 service Inventory {
 
   // Prices for one property
@@ -111,6 +114,23 @@ service Inventory {
   //
   // Billed as `period_in_days` hotel-day units.
   rpc GetRatePeriod (GetRatePeriodRequest) returns (GetRatePeriodResponse) {}
+
+  // Room type rate calendar
+  //
+  // For every date range of a calendar, the best available offer for each room type, cheapest first, so you
+  // can show "from" prices per room type. You choose which kinds of rate plan are considered with
+  // `rate_plan_types`, and can restrict the result to refundable offers or offers that include breakfast.
+  // A room type with no qualifying available offer in a range is left out of that range.
+  //
+  // Results are cached for up to 120 seconds; a change to a rate or rate plan normally shows sooner, but it can
+  // take longer to appear in some environments.
+  //
+  // The response can be large for big properties: it carries one offer per room type per date range, and a
+  // 30-day calendar has up to 900 ranges. gRPC clients commonly default to a 4 MiB receive limit; callers with
+  // many room types should request a shorter `period_in_days` or raise their client receive limit.
+  //
+  // Billed as `period_in_days` hotel-day units.
+  rpc GetRoomTypeRatePeriod (GetRoomTypeRatePeriodRequest) returns (GetRoomTypeRatePeriodResponse) {}
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -120,7 +140,7 @@ service Inventory {
 // Request for GetPropertyInventory.
 message GetPropertyInventoryRequest {
 
-  // Traveller context: dates, occupancy, language and currency. Required.
+  // Traveller context: dates, occupancy, language and the exchange rates you want back. Required.
   UserSession user_session = 1;
 
   // Which property to price. Set exactly one — `url_name` is accepted so you can price straight from a link
@@ -160,11 +180,6 @@ message GetPropertyInventoryResponse {
   // The property and its offers.
   PropertyInventory property = 1;
 
-  // ISO 4217 currency EVERY amount in this response is denominated in.
-  string currency_code = 2;
-
-  // How many decimal places `currency_code` has — amounts are `amount / 10^currency_exponent`.
-  int32 currency_exponent = 3;
 
   // ISO 639-1 language the names in this response are in.
   string language_code = 4;
@@ -175,9 +190,9 @@ message ListPropertyInventoryRequest {
 
   // The properties to price, each with its own dates and occupancy. At least one, at most 20.
   //
-  // Every entry must ask for the SAME `user_session.currency_code` and `user_session.language_code`, because the
-  // response declares one display currency for all of them. A batch that mixes currencies is rejected with
-  // INVALID_ARGUMENT rather than answered in a currency half the entries did not ask for.
+  // Every entry must ask for the SAME `user_session.language_code`, because the response declares one language
+  // for all of them. A batch that mixes languages is rejected with INVALID_ARGUMENT rather than answered in a
+  // language half the entries did not ask for. Currencies may differ freely: each property carries its own.
   repeated GetPropertyInventoryRequest entries = 1;
 }
 
@@ -191,11 +206,6 @@ message ListPropertyInventoryResponse {
   // attribute one property's prices to another. Nothing is billed for a failed batch.
   repeated PropertyInventory properties = 1;
 
-  // ISO 4217 currency EVERY amount in this response is denominated in.
-  string currency_code = 2;
-
-  // How many decimal places `currency_code` has — amounts are `amount / 10^currency_exponent`.
-  int32 currency_exponent = 3;
 
   // ISO 639-1 language the names in this response are in.
   string language_code = 4;
@@ -231,8 +241,50 @@ message GetRatePeriodRequest {
   // and with no language supplied every name falls back to its untranslated form.
   string language_code = 5;
 
-  // ISO 4217 currency for the returned prices. Exactly three characters.
-  string currency_code = 6;
+  // ISO 4217 currencies you want an exchange rate into -- same meaning and limits as
+  // `UserSession.quote_currencies`. The platform currency (USD) is always quoted as well.
+  repeated string quote_currencies = 6;
+}
+
+// Request for GetRoomTypeRatePeriod.
+message GetRoomTypeRatePeriodRequest {
+
+  // Stable property identifier. Required.
+  string property_id = 1;
+
+  // First check-in date to price, ISO-8601 "YYYY-MM-DD". Required.
+  string start_date = 2;
+
+  // How many days forward to price from `start_date`. Between 2 and 30. Required.
+  //
+  // This is also the billed unit count: a 30-day calendar costs 30 hotel-day units.
+  int32 period_in_days = 3;
+
+  // Adults per room, between 1 and 10. Omit it to take the default of 2.
+  int32 adults = 4;
+
+  // ISO 639-1 language for the room type and rate plan names, e.g. "en". Required.
+  string language_code = 5;
+
+  // ISO 4217 currencies you want an exchange rate into -- same meaning and limits as
+  // `UserSession.quote_currencies`. The platform currency (USD) is always quoted as well.
+  repeated string quote_currencies = 6;
+
+  // Which kinds of rate plan to consider. A rate plan is considered when it carries at least one of these.
+  // Omit it, or send only `RATE_PLAN_AUDIENCE_UNSPECIFIED`, to consider public rate plans only.
+  // `RATE_PLAN_AUDIENCE_UNSPECIFIED` mixed into a longer list is ignored.
+  //
+  // A rate plan is returned only when the property sells it through your account's sales channel AND it
+  // carries at least one of the kinds you asked for. Asking for a kind (for example
+  // `RATE_PLAN_AUDIENCE_MEMBER`) that the property has no rate plans of, or has not made available to your
+  // channel, returns nothing for it -- an empty result, not an error.
+  repeated RatePlanAudience rate_plan_types = 7;
+
+  // When true, only refundable offers are considered.
+  bool refundable_only = 8;
+
+  // When true, only offers that include breakfast are considered.
+  bool breakfast_included_only = 9;
 }
 
 // Response for GetRatePeriod.
@@ -241,14 +293,19 @@ message GetRatePeriodResponse {
   // The rate calendar.
   RatePeriod period = 1;
 
-  // ISO 4217 currency EVERY amount in this response is denominated in.
-  string currency_code = 2;
-
-  // How many decimal places `currency_code` has — amounts are `amount / 10^currency_exponent`.
-  int32 currency_exponent = 3;
 
   // ISO 639-1 language the names in this response are in.
   string language_code = 4;
+}
+
+// Response for GetRoomTypeRatePeriod.
+message GetRoomTypeRatePeriodResponse {
+
+  // The room type rate calendar.
+  RoomTypeRatePeriod period = 1;
+
+  // ISO 639-1 language the names in this response are in.
+  string language_code = 2;
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -259,7 +316,7 @@ message GetRatePeriodResponse {
 //
 // For anything else about the property — name, descriptions, gallery, address, amenities, policies, and its
 // restaurants, spas, meeting rooms and activities — call the Content service with `property_id` and cache the
-// answer against `last_update`.
+// answer against its `cache_token`.
 message PropertyInventory {
 
   // Stable property identifier. Your key for everything, including Content lookups.
@@ -293,10 +350,12 @@ message PropertyInventory {
   // Search would have shown for this property.
   repeated RoomTypeOffers room_types = 7;
 
-  // Every perk referenced by any `RoomRate.perk_ids` below, deduplicated — one entry per distinct perk,
-  // not one per rate. Resolve a perk id here rather than calling Content; a handful of distinct perks
-  // typically cover every rate in this response.
-  repeated PerkContent perks = 8;
+  // NOT POPULATED by this RPC; always empty. Perks are static content: resolve each `RoomRate.perk_ids` entry
+  // through `Content.GetProperty` with `CONTENT_SCOPE_PERK`, matching on the perk `id`. Every perk id on a
+  // rate is a perk bundled with a master rate, and Content lists those, so every id resolves there.
+  //
+  // Kept (number, name and type unchanged) so existing clients still parse; do not read it.
+  repeated PerkContent perks = 8 [deprecated = true];
 
   // Every add-on referenced by any `RoomRate.add_on_ids` above, deduplicated the same way perks are.
   //
@@ -316,6 +375,9 @@ message PropertyInventory {
   // itinerary, so everything here is meant to be shown. Empty unless the request carried
   // `INVENTORY_SCOPE_ANNOUNCEMENT`.
   repeated Announcement announcements = 11;
+
+  // The currency every amount in this property is in, and the exchange rates out of it.
+  PropertyCurrency currency = 13;
 }
 
 // One non-room item the property sells, and its priced rows.
@@ -333,14 +395,16 @@ message AncillaryInventory {
   // Which kind of item this is, so a single flat list can be grouped without inspecting ids.
   InventoryScope type = 2;
 
-  // Your channel's identifier for carrying this item. Present when the item reached you through a
-  // distribution channel rather than directly.
-  string channel_inventory_identifier = 3;
-
   // True if this item earns your account commission.
+  //
+  // Deprecated: only an add-on is sold, so only an add-on carries it. It is left unset for the venue types
+  // (restaurant, spa, meeting room, activity, attraction, place), which are static content. The field is kept so
+  // the wire contract does not break.
   bool commissionable = 4;
 
   // Commission rate on this item, as a fraction — 0.15 for 15%. Zero when `commissionable` is false.
+  //
+  // Deprecated: unset for the venue types, as `commissionable` above. Kept so the wire contract does not break.
   double commission = 5;
 
   // The bookable, priced rows for this item, CHEAPEST FIRST by `unit_price`. An item with no rows at all
@@ -357,8 +421,9 @@ message AncillaryInventory {
 //
 // Already resolved against your itinerary: a property's announcements each carry either a date window or
 // an "always show" flag, and both are evaluated server-side. Everything returned here is meant to be
-// displayed, so there is no window and no flag to re-check — publishing them would only invite each
-// integrator to re-implement the filter and get it subtly wrong.
+// displayed, so there is nothing to re-check. The window and the flag are published for DISPLAY only --
+// "valid until 31 March" -- and filtering on them yourself would invite getting an inclusive bound subtly
+// wrong.
 message Announcement {
 
   // Stable announcement identifier.
@@ -370,6 +435,16 @@ message Announcement {
 
   // True when the property wants the title shown above the body; false to render the body alone.
   bool show_title = 3;
+
+  // True when the announcement has no date window and is shown whatever the stay dates. When true,
+  // `start_date` and `end_date` are empty.
+  bool show_always = 4;
+
+  // First day the announcement applies, ISO-8601 "YYYY-MM-DD". Empty when `show_always` is true.
+  string start_date = 5;
+
+  // Last day the announcement applies, inclusive, ISO-8601 "YYYY-MM-DD". Empty when `show_always` is true.
+  string end_date = 6;
 }
 
 
@@ -394,6 +469,9 @@ message RatePeriod {
 
   // One entry per check-in/check-out combination in the range.
   repeated RatePeriodEntry entries = 6;
+
+  // The currency every `RatePeriodEntry.total` is in, and the exchange rates out of it.
+  PropertyCurrency currency = 7;
 }
 
 // The best available rate for one check-in/check-out combination.
@@ -427,9 +505,81 @@ message RatePeriodEntry {
   // True if breakfast is included.
   bool breakfast_included = 9;
 
-  // What the guest pays for this combination, in minor units of `currency_code`.
+  // What the guest pays for this combination, in minor units of `RatePeriod.currency`.
   //
   // Only meaningful when `available` is true. An unavailable combination reports 0, which means "no price"
   // rather than "free" — do not render it as a price.
   int64 total = 10;
+}
+
+// A room type rate calendar: the best offer per room type for each date range.
+message RoomTypeRatePeriod {
+
+  // Stable property identifier.
+  string property_id = 1;
+
+  // The property's name (not localized).
+  string name = 2;
+
+  // Adults every offer in this calendar is priced for -- the occupancy you asked for, stated once here.
+  int32 adults = 3;
+
+  // The currency every `RoomTypeRateOffer.total` is in, and the exchange rates out of it.
+  PropertyCurrency currency = 4;
+
+  // The check-in/check-out date ranges that have at least one qualifying offer, ordered by check-in date and
+  // then by number of nights. A range with no qualifying offer is omitted, so key each range on
+  // `start_date`/`end_date` and never index by position.
+  repeated RoomTypeRateRange ranges = 5;
+}
+
+// One check-in/check-out date range and the best offer for each room type that can be booked in it.
+message RoomTypeRateRange {
+
+  // Check-in date, ISO-8601 "YYYY-MM-DD".
+  string start_date = 1;
+
+  // Check-out date, ISO-8601 "YYYY-MM-DD".
+  string end_date = 2;
+
+  // Nights covered.
+  int32 room_nights = 3;
+
+  // The best offer for each room type that has one, cheapest first. The first entry is the best offer
+  // across all room types. Never empty for a returned range: a range with no qualifying offer is omitted.
+  repeated RoomTypeRateOffer offers = 4;
+}
+
+// The best qualifying offer for one room type in one date range.
+message RoomTypeRateOffer {
+
+  // Identifier of the room type this offer is for. Join to Content for its description, images and amenities.
+  string room_type_id = 1;
+
+  // The room type's name, in the requested language, falling back to English and then to the room type's
+  // default name.
+  string name = 2;
+
+  // Identifier of the rate plan that produced this offer.
+  string rate_plan_id = 3;
+
+  // The rate plan's name as configured by the property (not localized).
+  string rate_plan_name = 4;
+
+  // The kinds of rate plan this offer is sold as.
+  repeated RatePlanAudience rate_plan_audiences = 5;
+
+  // True if it can be cancelled without charge before the policy's deadline.
+  bool refundable = 6;
+
+  // Days from TODAY until free cancellation closes; -1 when not refundable, 0 when it closes today. Same
+  // calculation as `RoomRate.refundable_until_days`.
+  int32 refundable_until_days = 7;
+
+  // True if breakfast is included.
+  bool breakfast_included = 8;
+
+  // What the guest pays for this offer, in minor units of `RoomTypeRatePeriod.currency`, the property's own
+  // currency.
+  int64 total = 9;
 }

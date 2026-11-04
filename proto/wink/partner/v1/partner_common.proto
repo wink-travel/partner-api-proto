@@ -205,16 +205,14 @@ message Description {
 
 // One published image or video.
 //
-// Key anything you cache on `media_id`. It is stable for the life of the asset; URLs are not — they
-// carry transformation and delivery parameters that change without notice.
+// Key anything you cache on `entity_id`, the asset's Cloudinary public id. It is stable for the life of the
+// asset; URLs are not — they carry transformation and delivery parameters that change without notice.
 message Multimedia {
 
-  // Stable identifier for this asset. Use this as your cache key.
-  string media_id = 1;
-
-  // Identifier of the inventory item this asset belongs to (the property, a guest room, and so on).
-  // Named `entity_id` rather than `identifier` to match the `*_id` convention the rest of this surface
-  // uses, and because "identifier" said nothing about WHOSE identifier it is.
+  // The asset's Cloudinary public id: the stable identity of this image or video, and the key to use for
+  // your own cache. It can be used to build delivery URLs yourself, e.g.
+  // `https://res.cloudinary.com/<cloud>/image/upload/<transformations>/<entity_id>`; prefer the ready-made
+  // `urls` where they are present, since URLs can change.
   string entity_id = 2;
 
   // MEDIA_TYPE_IMAGE or MEDIA_TYPE_VIDEO.
@@ -259,8 +257,9 @@ message Multimedia {
 // host. Always check the variant you want is present rather than assuming a fixed set.
 //
 // THESE URLS MAY ROTATE. Wink's media-reorganization migration rewrites the underlying storage id of
-// every asset it touches, which changes every URL here. `Multimedia.media_id` does NOT change. Key your
-// storage on `media_id` and re-sync when `PropertySearchResult.content_version` moves; treating a URL as a
+// every asset it touches, which changes every URL here. `Multimedia.entity_id` (the Cloudinary public id) does NOT change. Key your
+// storage on `entity_id` and re-sync when the Content response's `cache_token` stops matching (send the stored
+// one as `known_versions`; NOT_MODIFIED means your copy is current); treating a URL as a
 // permanent identifier will break.
 message MediaUrlSet {
 
@@ -419,10 +418,11 @@ enum LifestyleType {
 // does not search for anything. A value used by more than one service belongs in common.
 // ---------------------------------------------------------------------------------------------------
 
-// Who is travelling, when, and in what currency and language.
+// Who is travelling, when, and in what language -- plus which exchange rates you want back.
 //
-// This drives pricing, not just presentation: `currency_code` selects the currency every Money on the response is
-// converted into, and `itinerary` determines both availability and how the call is billed.
+// `itinerary` drives pricing and availability, and determines how the call is billed. It does NOT choose a
+// currency: every amount comes back in the property's own currency (see `PropertyCurrency`), and
+// `quote_currencies` asks for the exchange rates to convert it.
 message UserSession {
 
   // Stay dates and occupancy. Required — searches without an itinerary cannot be priced.
@@ -432,12 +432,70 @@ message UserSession {
   // prose, pass the language to the Content service instead. Defaults to "en".
   string language_code = 2;
 
-  // ISO 4217 currency for all returned prices, e.g. "THB". Exactly three characters. Defaults to the
-  // property's own currency.
-  string currency_code = 3;
+  // ISO 4217 currencies you want an exchange rate into, e.g. ["EUR", "JPY"]. At most 10 distinct codes, each
+  // exactly three letters. Optional.
+  //
+  // The platform currency (USD) is ALWAYS quoted in addition to these, so a caller reporting to an analytics
+  // tool in USD needs to ask for nothing. Asking for the property's own currency is allowed and yields a rate
+  // of 1. A currency we hold no usable rate for is LEFT OUT of that property's `fx_quotes` rather than failing the call,
+  // so check the list for the currency you need. Only a missing USD rate fails the call, with NOT_FOUND.
+  repeated string quote_currencies = 3;
 
   // Promotional codes to apply. Codes your account is not entitled to are ignored, not rejected.
   repeated string promotional_codes = 4;
+}
+
+// The currency a property's prices are in, and the rates to convert them.
+//
+// ONE RULE: every amount under a property -- its offers, add-ons, ancillaries and calendar entries -- is an
+// integer in minor units of THIS currency, which is the property's own. A response never converts for you, so
+// two properties on one page can carry different currencies and each is exact.
+//
+// CONVERTING. Multiply the amount, in major units, by a quote's `rate` and round once at the target currency's
+// own number of decimal places. Convert a TOTAL, not each part: converting every night or fee separately and
+// summing drifts by up to a minor unit per part. Discounts, surcharges and fees have already been applied in
+// the property's currency, so conversion is the last step.
+//
+// QUOTES ARE FOR DISPLAY AND REPORTING. They never bind a charge: a booking is settled in the property's
+// currency whatever you showed the traveller.
+message PropertyCurrency {
+
+  // ISO 4217 code the property's amounts are denominated in, e.g. "THB".
+  string currency_code = 1;
+
+  // How many decimal places `currency_code` has: 2 for THB and USD, 0 for JPY, KRW and VND. Amounts are
+  // integers in MINOR UNITS, so the real value is `amount / 10^currency_exponent`. Published rather than
+  // assumed because a fixed divide-by-100 is wrong for a real slice of Wink's inventory -- a JPY stay priced
+  // at 15000 is ¥15,000, not ¥150.
+  int32 currency_exponent = 2;
+
+  // Exchange rates out of `currency_code`: the platform currency first, then each of
+  // `user_session.quote_currencies` in the order you sent them, each once. A requested currency with no usable rate is
+  // omitted.
+  //
+  // Find a rate by its `currency_code`, never by position: when the platform rate is missing, the first entry is
+  // a requested currency, not USD.
+  //
+  // In a page of search results, a property whose currency has no usable platform rate is returned with the quotes
+  // that do exist, possibly none, rather than failing the whole page: its amounts are in `currency_code` and are
+  // correct either way, so treat an empty or short list as "no rate to convert with", never as a zero rate. The
+  // calls that price ONE property or a batch of them (Inventory.GetPropertyInventory, Inventory.GetRatePeriod and
+  // Inventory.ListPropertyInventory, which is atomic) return NOT_FOUND instead.
+  repeated FxQuote fx_quotes = 3;
+}
+
+// An exchange rate from a property's currency into one other currency.
+message FxQuote {
+
+  // ISO 4217 code this rate converts INTO.
+  string currency_code = 1;
+
+  // Units of `currency_code` per ONE unit of the property's currency, as a decimal string such as "0.0275".
+  // A string rather than a double so the digits you receive are exactly the digits we hold. Always positive.
+  string rate = 2;
+
+  // When this rate was recorded, ISO-8601 in UTC, e.g. "2026-10-19T11:00:00Z".
+  string as_of = 3;
 }
 
 // Stay dates and occupancy.
@@ -568,10 +626,10 @@ message RoomTypeOffers {
 // amount covering every room, and it is the number to charge. Nothing here is per NIGHT — divide by
 // `room_nights` if you need a nightly figure, and expect it to be an average, since rates vary by date.
 //
-// MONEY CONVENTION. Every monetary field is an INTEGER IN MINOR UNITS of the response's `currency_code` —
-// divide by 10^`currency_exponent` to get the real value. The currency and its exponent are stated once
-// per response instead of on every amount, so amounts are directly comparable and directly addable with
-// exact integer arithmetic and no rounding.
+// MONEY CONVENTION. Every monetary field is an INTEGER IN MINOR UNITS of the enclosing property's
+// `PropertyCurrency.currency_code` — divide by 10^`currency_exponent` to get the real value. The currency and
+// its exponent are stated once per property instead of on every amount, so a property's amounts are directly
+// addable with exact integer arithmetic and no rounding.
 //
 // The same vocabulary means the same things on the ancillary side — see `AncillaryOffer`.
 message RoomRate {
@@ -654,12 +712,16 @@ message RoomRate {
   // Cancellation policy identifier. Join to Content for the full terms and wording.
   string cancellation_policy_id = 17;
 
-  // Identifiers of the perks bundled with this rate. Join to Content for their names and descriptions.
+  // Identifiers of the perks bundled with this rate's master rate. Every id resolves through
+  // `Content.GetProperty` with `CONTENT_SCOPE_PERK`: match on the perk `id` for names and descriptions.
+  // `PropertyInventory.perks` is not populated by Inventory.
   // There is deliberately no monetary "perk value" on this surface.
   repeated string perk_ids = 18;
 
   // Identifiers of the add-ons purchasable ALONGSIDE this offer, resolved against
-  // `PropertyInventory.add_ons` in the same response — the same dictionary pattern as `perk_ids`.
+  // `PropertyInventory.add_ons` in the same response — the same dictionary pattern as `perk_ids`. Each id is
+  // also an `AddOnContent.id` (`Content.GetProperty`, CONTENT_SCOPE_ADD_ON), which carries the add-on's name,
+  // descriptions and media; the priced rows here carry none of that.
   //
   // Add-ons hang off the OFFER, not the property: the pricing engine matches them per room configuration
   // (`RoomConfigurationPrice.addOnOffers`), so which add-ons are available genuinely differs between two
@@ -712,8 +774,7 @@ message RoomRate {
   //
   // To book one, quote its `id` as BookingAncillaryRequest.offer_id and this rate's `room_rate_id` as
   // `inventory_id`. Unlike every other ancillary the inventory id is the RATE, because the gate for
-  // these is keyed by the master rate rather than by an entity. Leave
-  // BookingAncillaryRequest.channel_inventory_id blank — that is the common case and not an error.
+  // these is keyed by the master rate rather than by an entity.
   repeated AncillaryOffer room_type_ancillaries = 27;
 
   // How many rooms the property still has for the WHOLE stay — the "only 2 left" number.
@@ -807,10 +868,11 @@ message MealPlan {
 
 // A perk bundled with a rate.
 //
-// Lives here rather than in partner_content.proto because the PRICING surfaces return a deduplicated
-// dictionary of these alongside their rates: `RoomRate.perk_ids` would otherwise be unresolvable without a
-// second call, and inlining the perk on every rate would repeat a handful of distinct perks across every
-// rate of every room type of every property in a search result.
+// Lives here rather than in partner_content.proto because Search returns a deduplicated dictionary of these
+// alongside its rates (`PropertySearchResult.perks`): inlining the perk on every rate would repeat a handful of
+// distinct perks across every rate of every room type of every property in a search result. Inventory does NOT
+// return the dictionary (`PropertyInventory.perks` is deprecated and empty); resolve its `perk_ids` through
+// Content.
 //
 // `descriptions` carries the display name and body together — Description has both.
 message PerkContent {
@@ -885,6 +947,40 @@ enum InventoryScope {
   INVENTORY_SCOPE_ROOM_TYPE_ANCILLARY = 9;
 }
 
+// Who a rate plan is sold to.
+//
+// A rate plan carries one or more of these. Use them to choose which kinds of rate plan a rate calendar
+// should consider, and to label an offer. They are a classification only: they do not hide or mask the
+// property and they do not grant access to anything.
+enum RatePlanAudience {
+
+  // Not set; ignored. Sending only this is the same as sending nothing, which selects
+  // `RATE_PLAN_AUDIENCE_PUBLIC`.
+  RATE_PLAN_AUDIENCE_UNSPECIFIED = 0;
+
+  // Anyone can book it, with no code, membership or contract.
+  RATE_PLAN_AUDIENCE_PUBLIC = 1;
+
+  // Sold to members, for example a loyalty programme.
+  RATE_PLAN_AUDIENCE_MEMBER = 2;
+
+  // Sold to a closed user group, such as the customers of one partner or a private channel.
+  RATE_PLAN_AUDIENCE_CLOSED_USER_GROUP = 3;
+
+  // Sold to anyone who holds a promotion code.
+  RATE_PLAN_AUDIENCE_PROMO_CODE = 4;
+
+  // A rate negotiated with a specific customer or company, for example a corporate rate.
+  RATE_PLAN_AUDIENCE_NEGOTIATED = 5;
+
+  // A wholesale or net rate sold to travel trade.
+  RATE_PLAN_AUDIENCE_WHOLESALE = 6;
+
+  // An opaque rate, sold without naming the property until booked elsewhere. This is a classification only:
+  // the property is NOT masked in this API's responses.
+  RATE_PLAN_AUDIENCE_OPAQUE = 7;
+}
+
 // One priced, bookable row of non-room inventory — a spa treatment, a table sitting, a tour departure.
 //
 // PRICES ARE PER UNIT, and there is no total. `RoomRate` can publish one because the room count is in your
@@ -910,7 +1006,7 @@ enum InventoryScope {
 // `nights` is the itinerary you asked to be priced; the occupancy is likewise yours to apply. Honour
 // `min_pax`/`max_pax` before quoting: a row is not bookable outside them.
 //
-// MONEY. Minor units of the response's `currency_code`, exactly as on `RoomRate`, so ancillary and room
+// MONEY. Minor units of the enclosing property's `PropertyCurrency.currency_code`, exactly as on `RoomRate`, so ancillary and room
 // amounts are addable without conversion.
 message AncillaryOffer {
 
@@ -951,6 +1047,63 @@ message AncillaryOffer {
   // Quantity-invariant, which is what makes it safe here even though this message has no total: the
   // percentage a traveller sees does not change with how many they buy.
   double discount_percent = 9;
+
+  // True when the property requires this offer on every room it books. You do not add it and cannot remove
+  // it: the platform adds it to each room at CreateBooking, whatever `ancillaries` carries, so a request
+  // that omits it is charged for it all the same, and an entry you send for it is replaced.
+  //
+  // IT IS A SEPARATE LINE, NOT PART OF THE ROOM PRICE. `RoomRate.unit_price` and its totals stay room-only;
+  // show a mandatory offer beside the room as a required extra and add it to the total you display.
+  //
+  // THE QUANTITY IS PER ROOM AND FOLLOWS `pricing_type`, not a choice you make:
+  //
+  //   PER_STAY, PER_NIGHT, PER_DAY, PER_USE, PER_HOUR
+  //                                          quantity = 1 per room
+  //   PER_PERSON, PER_PERSON_PER_NIGHT, PER_PERSON_PER_HOUR
+  //                                          quantity = guests in that room (adults + children)
+  //   PER_ADULT, PER_ADULT_PER_NIGHT, PER_ADULT_PER_HOUR
+  //                                          quantity = adults in that room
+  //   PER_CHILD, PER_CHILD_PER_NIGHT, PER_CHILD_PER_HOUR
+  //                                          quantity = children in that room (never less than 1)
+  //
+  // ADULTS AND CHILDREN ARE COUNTED BY THE PROPERTY'S CHILD AGE CUT-OFF, not by how you labelled the guests:
+  // a guest older than the property's `children_minimum_age` counts as an ADULT, one at or below it as a
+  // CHILD, exactly as the room itself is priced. A property that declares no cut-off counts only the
+  // room's adults. Send every child's real age in `child_ages`: it decides the quantity.
+  //
+  // then multiply by nights as the table above says. With N identical rooms the charge is repeated N
+  // times. The stay runs from the property's check-in time on the arrival date (14:00 when it declares none)
+  // to the same time on the departure date, so nights are whole nights. An hourly mandatory offer is
+  // priced for a single one-hour window starting at that check-in time, since there is no time window at
+  // booking.
+  bool mandatory = 10;
+
+  // Room types this offer may be sold with, as `RoomTypeOffers.room_type_id`. EMPTY MEANS EVERY ROOM TYPE.
+  //
+  // An offer list is per property, not per room, so it carries restrictions you apply yourself: show an
+  // offer beside a room only when this is empty or lists that room's `room_type_id`.
+  // `CreateBooking` answers INVALID_ARGUMENT, naming the offer, when you send one on a room it excludes. It
+  // does not drop the offer: that would change the price you showed.
+  repeated string room_type_ids = 11;
+
+  // Rate plans this offer may be sold with, as `RoomRate.rate_plan_id`. EMPTY MEANS EVERY RATE PLAN.
+  // Combine with `room_type_ids`: an offer must pass both. Same filtering and same refusal at `CreateBooking`.
+  repeated string rate_plan_ids = 12;
+
+  // The add-on this row prices, as `AddOnContent.id` from `Content.GetProperty` with CONTENT_SCOPE_ADD_ON. That
+  // is where its name, descriptions and media are; this message carries only the price.
+  //
+  // Set on the offers under `PropertyInventory.add_ons` AND on the priced rows of the other ancillaries
+  // (restaurants, spas and so on): a venue's rows are built from the add-ons categorised under it, so the row's
+  // `id` is the add-on id and this repeats it as the explicit join key. A venue's own `inventory_id` is NOT an
+  // add-on id; this field is what resolves a row to its package copy. EMPTY only when a row was not built from
+  // an add-on.
+  string add_on_id = 13;
+
+  // Localized promotion copy the price calculator attached when a discount or surcharge applied, in English
+  // plus your requested language. Empty when none applies. This is the OFFER's own promotion text, not the
+  // add-on's description (that is on Content), and not `promotion`, which is a promo code.
+  repeated Description offer_details = 14;
 }
 
 // How a non-room item is sold, and therefore how to multiply `AncillaryOffer.unit_price` up to a total.
