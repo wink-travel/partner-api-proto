@@ -9,6 +9,15 @@ in `monorepo-java` when it cuts a release; do not hand-edit past entries.
 
 ## [Unreleased]
 
+## [2.0.1] — 2026-11-07
+
+Released from `monorepo-java` fbd8967a8970.
+
+### Fixed
+
+- price only public rate plans on GetRatePeriod unless rate_plan_types asks for more
+- bill the Partner API in hotel-nights, not hotel-days
+
 ## [2.0.0] — 2026-11-04
 
 Released from `monorepo-java` 13c8ceb7ec1e.

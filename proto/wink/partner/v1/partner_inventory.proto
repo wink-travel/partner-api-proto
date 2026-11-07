@@ -84,7 +84,7 @@ option java_outer_classname = "PartnerInventoryProto";
 // dragging the half that changes by the month across the wire on every call.
 //
 // Every call needs an authenticated token with `INVENTORY:READ` on the account you name in the
-// `managing-entity-id` metadata header, and is billed in hotel-day units.
+// `managing-entity-id` metadata header, and is billed in hotel-night units.
 //
 // Prices come from a short-lived cache (up to 120 seconds for the rate calendars), so a result can be slightly
 // behind a very recent rate change. Treat a result as valid for the length of a user's session.
@@ -95,7 +95,7 @@ service Inventory {
   // Returns every offer bookable at this property for the requested dates and occupancy, cheapest first.
   // Identify the property by `property_id` or by `url_name` — set exactly one.
   //
-  // Billed as min(itinerary nights, 90) hotel-day units, whether or not anything is available.
+  // Billed as min(itinerary nights, 90) hotel-night units, whether or not anything is available.
   rpc GetPropertyInventory (GetPropertyInventoryRequest) returns (GetPropertyInventoryResponse) {}
 
   // Prices for several properties
@@ -112,7 +112,10 @@ service Inventory {
   // The best available rate for every check-in/check-out combination across a date range — what you need to
   // render a "cheapest night to stay" calendar without one call per date.
   //
-  // Billed as `period_in_days` hotel-day units.
+  // Only public rate plans are priced unless you ask for other kinds with `rate_plan_types`, so a member,
+  // closed-user-group, wholesale or negotiated rate can never become the "cheapest night" you show to everyone.
+  //
+  // Billed as one hotel-night unit per calendar day in the window, i.e. `period_in_days` units.
   rpc GetRatePeriod (GetRatePeriodRequest) returns (GetRatePeriodResponse) {}
 
   // Room type rate calendar
@@ -129,7 +132,7 @@ service Inventory {
   // 30-day calendar has up to 900 ranges. gRPC clients commonly default to a 4 MiB receive limit; callers with
   // many room types should request a shorter `period_in_days` or raise their client receive limit.
   //
-  // Billed as `period_in_days` hotel-day units.
+  // Billed as one hotel-night unit per calendar day in the window, i.e. `period_in_days` units.
   rpc GetRoomTypeRatePeriod (GetRoomTypeRatePeriodRequest) returns (GetRoomTypeRatePeriodResponse) {}
 }
 
@@ -160,7 +163,7 @@ message GetPropertyInventoryRequest {
   // Each scope you add prices one more class of bookable item. Unrecognised values are ignored rather than
   // rejected, so a client built against a newer version of this file still works.
   //
-  // This does NOT change what you are billed: the meter counts hotel-days from the itinerary, not sections
+  // This does NOT change what you are billed: the meter counts hotel-nights from the itinerary, not sections
   // of the response.
   repeated InventoryScope include = 4;
 
@@ -231,7 +234,7 @@ message GetRatePeriodRequest {
 
   // How many days forward to price from `start_date`. Between 2 and 30. Required.
   //
-  // This is also the billed unit count: a 30-day calendar costs 30 hotel-day units.
+  // This is also the billed unit count: one unit per calendar day in the window, so a 30-day calendar costs 30 hotel-night units.
   int32 period_in_days = 3;
 
   // Adults per room, between 1 and 10. Omit it to take the default of 2.
@@ -244,6 +247,15 @@ message GetRatePeriodRequest {
   // ISO 4217 currencies you want an exchange rate into -- same meaning and limits as
   // `UserSession.quote_currencies`. The platform currency (USD) is always quoted as well.
   repeated string quote_currencies = 6;
+
+  // Which kinds of rate plan to price. A rate plan is priced when it carries at least one of these.
+  // Omit it, or send only `RATE_PLAN_AUDIENCE_UNSPECIFIED`, to price public rate plans only.
+  // `RATE_PLAN_AUDIENCE_UNSPECIFIED` mixed into a longer list is ignored. Same meaning as
+  // `GetRoomTypeRatePeriodRequest.rate_plan_types`.
+  //
+  // A date range with no available plan of the kinds you asked for is left out of the calendar -- an empty
+  // result, not an error.
+  repeated RatePlanAudience rate_plan_types = 9;
 }
 
 // Request for GetRoomTypeRatePeriod.
@@ -257,7 +269,7 @@ message GetRoomTypeRatePeriodRequest {
 
   // How many days forward to price from `start_date`. Between 2 and 30. Required.
   //
-  // This is also the billed unit count: a 30-day calendar costs 30 hotel-day units.
+  // This is also the billed unit count: one unit per calendar day in the window, so a 30-day calendar costs 30 hotel-night units.
   int32 period_in_days = 3;
 
   // Adults per room, between 1 and 10. Omit it to take the default of 2.

@@ -124,7 +124,7 @@ option java_outer_classname = "PartnerSearchProto";
 // property content has exactly one source of truth.
 //
 // Every call needs an authenticated token with `INVENTORY:READ` on the account you pass, and is billed in
-// hotel-day units: (properties actually returned) x min(itinerary nights, 90). You are charged for what comes
+// hotel-night units: (properties actually returned) x min(itinerary nights, 90). You are charged for what comes
 // back, not for what you asked for — a request for 50 results that matches 3 properties bills 3 properties.
 //
 // Prices are live and are not cached. Treat a result as valid for the length of a user's session.
