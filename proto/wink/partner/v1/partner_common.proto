@@ -249,12 +249,13 @@ message Multimedia {
   string ota_pic_category = 12;
 }
 
-// Ready-to-use delivery URLs for one asset, one field per variant.
+// Ready-to-use delivery URLs for one asset.
 //
-// Which fields are populated depends on the asset. Images carry `original`, `large`, `medium` and
-// `thumbnail`; Cloudinary videos carry `stream`, `preview`, `poster` and `thumbnail`; externally-hosted
-// video (YouTube) carries only `external_url`, because Wink generates no variants for media it does not
-// host. Always check the variant you want is present rather than assuming a fixed set.
+// Which fields are populated depends on the asset. An image carries only `image`: ONE url whose width is the
+// literal token `{size}`, which you replace with the pixel width you want. Cloudinary videos carry `stream`,
+// `preview`, `poster` and `thumbnail`; externally-hosted video (YouTube) carries only `external_url`, because Wink
+// generates no variants for media it does not host. Always check the field you want is present rather than
+// assuming a fixed set.
 //
 // THESE URLS MAY ROTATE. Wink's media-reorganization migration rewrites the underlying storage id of
 // every asset it touches, which changes every URL here. `Multimedia.entity_id` (the Cloudinary public id) does NOT change. Key your
@@ -263,18 +264,9 @@ message Multimedia {
 // permanent identifier will break.
 message MediaUrlSet {
 
-  // MULTIMEDIA_KIND_IMAGE only: unscaled, best-quality delivery URL.
-  MediaUrlVariant original = 1;
-
-  // MULTIMEDIA_KIND_IMAGE only: large variant, max width 1920px.
-  MediaUrlVariant large = 2;
-
-  // MULTIMEDIA_KIND_IMAGE only: medium variant, max width 1024px.
-  MediaUrlVariant medium = 3;
-
-  // MULTIMEDIA_KIND_IMAGE or MULTIMEDIA_KIND_VIDEO (Cloudinary): thumbnail variant, max width 320px. For video
-  // this is a still frame extracted from the video, so its `format` is an image type and follows
-  // `image_format`, not `video_format`.
+  // MULTIMEDIA_KIND_VIDEO (Cloudinary) only: thumbnail variant, max width 320px. A still frame extracted from the
+  // video, so its `format` is an image type and follows `image_format`, not `video_format`. (Images no longer carry
+  // a thumbnail variant: substitute 320 into `image` instead.)
   MediaUrlVariant thumbnail = 4;
 
   // MULTIMEDIA_KIND_VIDEO (Cloudinary) only: streaming delivery URL, unscaled. Delivered as `video_format`,
@@ -289,8 +281,28 @@ message MediaUrlSet {
   MediaUrlVariant poster = 7;
 
   // MULTIMEDIA_KIND_VIDEO (YouTube) only: pass-through to the YouTube watch URL. Wink generates no variants for
-  // externally-hosted media, so no format applies and every MediaUrlVariant field above is unset.
+  // externally-hosted media, so no format applies and every other field is unset.
   string external_url = 8;
+
+  // MULTIMEDIA_KIND_IMAGE only: the image's delivery URL with the width left as a `{size}` placeholder.
+  ImageUrlTemplate image = 9;
+}
+
+// An image delivery URL with its width left open. Replace the literal token `{size}` in `url` with a pixel width
+// from 160, 320, 640, 1024 or 1920 -- for example `https://cdn.wink.travel/img/hotel/lobby?w={size}&f=jpg` becomes
+// `https://cdn.wink.travel/img/hotel/lobby?w=640&f=jpg`. Those five are the supported widths: they keep the CDN cache
+// to a handful of renditions per image. Treat the URL as opaque apart from that token: its host and where the token
+// sits can change (it is the `w` query parameter on the Wink CDN, a transformation segment on the origin), and the
+// substitution works the same either way. The unscaled `original` is gone, use 1920.
+message ImageUrlTemplate {
+
+  // Absolute HTTPS URL containing the literal token `{size}` exactly once.
+  string url = 1;
+
+  // The IANA media type this URL returns: image/jpeg, image/png, image/webp or image/*. Echoes the `image_format`
+  // you sent on the request (image/jpeg when you sent none). image/* means the CDN negotiates per client from the
+  // Accept header.
+  string format = 2;
 }
 
 // One delivery URL, what it is scaled to, and what it will actually return.
@@ -299,8 +311,8 @@ message MediaUrlVariant {
   // Ready-to-use delivery URL for this variant.
   string url = 1;
 
-  // Maximum pixel width this variant is scaled to. Unset for variants with no resize (image
-  // "original", video "stream") — explicit presence so "not resized" is distinguishable from a
+  // Maximum pixel width this variant is scaled to. Unset for variants with no resize (video
+  // "stream") — explicit presence so "not resized" is distinguishable from a
   // literal 0px width.
   optional int32 max_width = 2;
 
@@ -567,8 +579,8 @@ message RoomTypeOffers {
   // The room type's name, in the requested language where a translation exists.
   string name = 2;
 
-  // A ready-to-use delivery URL for a single representative image of the room, scaled to 1024px wide
-  // (Cloudinary's medium variant — c_scale, dpr_auto, f_auto, q_auto:best, w_1024). The lowest-sorted
+  // A delivery URL TEMPLATE for a single representative image of the room: the width is the literal token
+  // `{size}`, which you replace with 160, 320, 640, 1024 or 1920 (see ImageUrlTemplate). The lowest-sorted
   // published image; unset when the room has none.
   //
   // A plain URL rather than the full Multimedia object deliberately: this is a rates surface, not a
