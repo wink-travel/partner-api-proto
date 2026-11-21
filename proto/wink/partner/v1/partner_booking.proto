@@ -446,12 +446,6 @@ enum BookingStatus {
   // Refund is NOT a status. A booking can be refunded without having been cancelled and cancelled
   // without being refunded, so the two cannot share one field — that conflation is what let an async
   // refund webhook overwrite CANCELLED, and vice versa. Read `refund` for whether money came back.
-  //
-  // 7 and 8 held PARTIALLY_REFUNDED / FULLY_REFUNDED. Removed rather than deprecated because this
-  // service has never been released, so no client can hold the old numbers. Reserved so they cannot
-  // be reused for an unrelated meaning and silently reinterpret an old capture.
-  reserved 7, 8;
-  reserved "BOOKING_STATUS_PARTIALLY_REFUNDED", "BOOKING_STATUS_FULLY_REFUNDED";
 }
 
 // How a booking came to exist.

@@ -9,6 +9,20 @@ in `monorepo-java` when it cuts a release; do not hand-edit past entries.
 
 ## [Unreleased]
 
+## [3.0.0] — 2026-11-21
+
+Released from `monorepo-java` 7a6980bfc011.
+
+### Breaking
+
+- drop every reserved statement from the proto contracts
+- return one {size} URL template per image instead of fixed variants
+
+### Added
+
+- serve image URL templates from the cdn.wink.travel Worker
+
+
 ## [2.0.1] — 2026-11-07
 
 Released from `monorepo-java` fbd8967a8970.
