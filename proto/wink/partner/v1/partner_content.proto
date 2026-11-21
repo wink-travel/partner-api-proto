@@ -584,13 +584,7 @@ message PropertyContent {
   // This is the property's own description of what it sells, like `restaurants`: it is not filtered by your
   // sales channel, so a returned add-on is not necessarily one your channel can sell. Whether it is comes
   // from the priced offers, which only carry add-ons you can.
-  //
-  // 14 held `add_ons` as a `repeated InventoryItemContent` before it was removed without being reserved, and a
-  // reintroduced field must not reuse a retired number, so this one is 23.
   repeated AddOnContent add_ons = 23;
-
-  // Retired: the earlier `add_ons`, typed `InventoryItemContent`. Never reuse.
-  reserved 14;
 
 
   // How many of each ancillary entity this property has. ALWAYS present, whatever you included, and the
@@ -690,12 +684,8 @@ enum ContentScope {
   CONTENT_SCOPE_GREEN_INDEX = 15;
 
   // The property's add-ons as static content, without prices. Join from `AncillaryOffer.add_on_id` and
-  // `RoomRate.add_on_ids`. 9 held this scope before it was removed without being reserved; the number is
-  // retired below and this one is 16.
+  // `RoomRate.add_on_ids`.
   CONTENT_SCOPE_ADD_ON = 16;
-
-  // Retired: the earlier CONTENT_SCOPE_ADD_ON. Never reuse.
-  reserved 9;
 }
 
 // One award, certification or third-party rating a property holds.
@@ -1142,12 +1132,6 @@ message RoomTypeContent {
 
   // Whether the room is shared with other guests, as in a dorm bed.
   bool shared_room = 31;
-
-  // 16 held `repeated string bed_configuration` — layout NAMES with no ids, which no caller could use to
-  // book a specific layout. Reserved rather than retyped in place so the tag cannot be reused for an
-  // unrelated meaning and silently reinterpret an old capture.
-  reserved 16;
-  reserved "bed_configuration";
 }
 
 // Gender assignment of a room, for gender-segregated accommodation such as hostel dorms.
@@ -1303,13 +1287,10 @@ message InventoryItemContent {
   // OpenTravel PHY (Accessibility Feature) codes.
   repeated string ota_phy_accessibility_features = 18;
 
-  // 10 held a single `repeated string amenities` that flattened FOUR different OpenTravel code tables
-  // together — restaurants used RSI, spas SPA, meeting rooms MRC, activities REC — so a caller could not
-  // tell which table to look a value up in. Split into one field per table above; exactly one is ever
-  // populated, decided by which PropertyContent collection the item came back in. Attractions, places and
-  // add-ons record no amenities at all and populate none of them.
-  reserved 10;
-  reserved "amenities";
+  // The amenity fields above are one per OpenTravel code table -- restaurants use RSI, spas SPA, meeting rooms
+  // MRC, activities REC -- so a caller knows which table to look a value up in. Exactly one is ever populated,
+  // decided by which PropertyContent collection the item came back in. Attractions, places and add-ons record no
+  // amenities at all and populate none of them.
 
   // Opening time, local to the property, "HH:mm". Empty when the venue records none (spas, activities and
   // places often do not).

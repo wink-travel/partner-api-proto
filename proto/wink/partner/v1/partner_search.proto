@@ -48,10 +48,9 @@ option java_outer_classname = "PartnerSearchProto";
 // this repo actually depends on it, at which point `reserved` becomes mandatory and this note should say
 // so.
 //
-// SearchRoomRate's `reserved 19, 27` is the one exception, and it is NOT this policy: it exists to keep
-// SearchRoomRate diffable against the sibling RoomRate message, which still legitimately uses those tags
-// for different fields (see SearchRoomRateParityTest and the note on SearchRoomRate itself), not because
-// any external decoder depends on it.
+// PartnerContractHasNoReservedTest holds this: no message or enum in the contracts declares `reserved`.
+// SearchRoomRate deliberately leaves tags 19 and 27 undeclared to stay diffable against RoomRate; that is
+// kept by SearchRoomRateParityTest, not by reserving them.
 //
 // METERED SURFACE. Do NOT call PartnerGrpcUsageGuard from PartnerSearchGrpcService — that guard is
 // free-surface-only. Billing happens because PartnerSearchServiceImpl's nine methods carry
@@ -779,8 +778,8 @@ message SearchRoomTypeOffers {
   // The room type's name, in the requested language where a translation exists.
   string name = 2;
 
-  // A ready-to-use delivery URL for a single representative image of the room, scaled to 1024px wide
-  // (Cloudinary's medium variant — c_scale, dpr_auto, f_auto, q_auto:best, w_1024). The lowest-sorted
+  // A delivery URL TEMPLATE for a single representative image of the room: the width is the literal token
+  // `{size}`, which you replace with 160, 320, 640, 1024 or 1920 (see ImageUrlTemplate). The lowest-sorted
   // published image; unset when the room has none.
   //
   // A plain URL rather than the full Multimedia object deliberately: this is a rates surface, not a
@@ -954,10 +953,9 @@ message SearchRoomRate {
   // sensitive: it is exact enough to reconstruct a property's booking curve if sampled over time.
   int32 rooms_left = 25;
 
-  // Tags 19 and 27 held `add_on_ids` and `room_type_ancillaries`, which this message deliberately does not
-  // carry -- see `add_on_count`. Reserved rather than reused so the two messages stay diffable: every tag
-  // SearchRoomRate does declare means exactly what the same tag means on RoomRate.
-  reserved 19, 27;
+  // Tags 19 and 27 (`add_on_ids` and `room_type_ancillaries` on RoomRate) are deliberately not declared on this
+  // message -- see `add_on_count`. Every tag SearchRoomRate does declare means exactly what the same tag means
+  // on RoomRate (SearchRoomRateParityTest).
 
   // How many extras -- add-ons plus in-room ancillaries -- can be bought alongside this offer. Zero when
   // it sells none.
@@ -1061,9 +1059,10 @@ message PropertySearchResult {
   // Official star rating, 1-5. Zero when unrated.
   int32 star_rating = 6;
 
-  // A ready-to-use delivery URL for a single representative image of the property, scaled to 1024px wide
-  // (Cloudinary's medium variant), the same convention `SearchRoomTypeOffers.hero_image_url` already uses
-  // for a room. The lowest-sorted published image; unset when the property has none.
+  // A delivery URL TEMPLATE for a single representative image of the property: the width is the literal token
+  // `{size}`, which you replace with 160, 320, 640, 1024 or 1920 (see ImageUrlTemplate), the same convention
+  // `SearchRoomTypeOffers.hero_image_url` uses for a room. The lowest-sorted published image; unset when the
+  // property has none.
   //
   // A plain URL rather than the full Multimedia object deliberately: this is a pricing surface, not a
   // content surface, and the full object carries localized captions, camera angle and lifestyle tagging --
