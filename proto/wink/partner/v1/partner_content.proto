@@ -394,7 +394,7 @@ message Review {
   // How many members liked the review.
   int32 likes = 7;
 
-  // The Cloudinary public id of the review's image. Set only when an approved image exists, and then
+  // The public id of the review's image. Set only when an approved image exists, and then
   // together with `urls`. Stable across media reorganisations, unlike the URLs.
   string entity_id = 8;
 

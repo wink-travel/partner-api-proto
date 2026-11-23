@@ -9,6 +9,14 @@ in `monorepo-java` when it cuts a release; do not hand-edit past entries.
 
 ## [Unreleased]
 
+## [3.0.1] — 2026-11-23
+
+Released from `monorepo-java` 08ed4df30a43.
+
+### Fixed
+
+- stop telling integrators to build Cloudinary URLs
+
 ## [3.0.0] — 2026-11-21
 
 Released from `monorepo-java` 7a6980bfc011.
