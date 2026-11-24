@@ -205,14 +205,13 @@ message Description {
 
 // One published image or video.
 //
-// Key anything you cache on `entity_id`, the asset's Cloudinary public id. It is stable for the life of the
+// Key anything you cache on `entity_id`, the asset's public id. It is stable for the life of the
 // asset; URLs are not — they carry transformation and delivery parameters that change without notice.
 message Multimedia {
 
-  // The asset's Cloudinary public id: the stable identity of this image or video, and the key to use for
-  // your own cache. It can be used to build delivery URLs yourself, e.g.
-  // `https://res.cloudinary.com/<cloud>/image/upload/<transformations>/<entity_id>`; prefer the ready-made
-  // `urls` where they are present, since URLs can change.
+  // The asset's public id: the stable identity of this image or video, and the key to use for your own
+  // cache. Do not build delivery URLs from it yourself: use the ready-made `urls`, which carry the delivery
+  // parameters and can change.
   string entity_id = 2;
 
   // MEDIA_TYPE_IMAGE or MEDIA_TYPE_VIDEO.
@@ -240,7 +239,7 @@ message Multimedia {
   LifestyleType lifestyle_type = 10;
 
   // Ready-to-use delivery URLs, one per variant. Which variants are populated depends on whether the
-  // asset is an image, a Cloudinary video or an externally-hosted one — see MediaUrlSet.
+  // asset is an image, a video hosted by Wink or an externally-hosted one — see MediaUrlSet.
   MediaUrlSet urls = 11;
 
   // OpenTravel PIC (Picture Category) code, e.g. "2" = Lobby view, "6" = Guest room. What the asset depicts,
@@ -252,31 +251,31 @@ message Multimedia {
 // Ready-to-use delivery URLs for one asset.
 //
 // Which fields are populated depends on the asset. An image carries only `image`: ONE url whose width is the
-// literal token `{size}`, which you replace with the pixel width you want. Cloudinary videos carry `stream`,
+// literal token `{size}`, which you replace with the pixel width you want. Videos hosted by Wink carry `stream`,
 // `preview`, `poster` and `thumbnail`; externally-hosted video (YouTube) carries only `external_url`, because Wink
 // generates no variants for media it does not host. Always check the field you want is present rather than
 // assuming a fixed set.
 //
 // THESE URLS MAY ROTATE. Wink's media-reorganization migration rewrites the underlying storage id of
-// every asset it touches, which changes every URL here. `Multimedia.entity_id` (the Cloudinary public id) does NOT change. Key your
+// every asset it touches, which changes every URL here. `Multimedia.entity_id` (the asset's public id) does NOT change. Key your
 // storage on `entity_id` and re-sync when the Content response's `cache_token` stops matching (send the stored
 // one as `known_versions`; NOT_MODIFIED means your copy is current); treating a URL as a
 // permanent identifier will break.
 message MediaUrlSet {
 
-  // MULTIMEDIA_KIND_VIDEO (Cloudinary) only: thumbnail variant, max width 320px. A still frame extracted from the
+  // MULTIMEDIA_KIND_VIDEO (hosted by Wink) only: thumbnail variant, max width 320px. A still frame extracted from the
   // video, so its `format` is an image type and follows `image_format`, not `video_format`. (Images no longer carry
   // a thumbnail variant: substitute 320 into `image` instead.)
   MediaUrlVariant thumbnail = 4;
 
-  // MULTIMEDIA_KIND_VIDEO (Cloudinary) only: streaming delivery URL, unscaled. Delivered as `video_format`,
+  // MULTIMEDIA_KIND_VIDEO (hosted by Wink) only: streaming delivery URL, unscaled. Delivered as `video_format`,
   // which defaults to video/mp4.
   MediaUrlVariant stream = 5;
 
-  // MULTIMEDIA_KIND_VIDEO (Cloudinary) only: preview variant, max width 1280px. Delivered as `video_format`.
+  // MULTIMEDIA_KIND_VIDEO (hosted by Wink) only: preview variant, max width 1280px. Delivered as `video_format`.
   MediaUrlVariant preview = 6;
 
-  // MULTIMEDIA_KIND_VIDEO (Cloudinary) only: poster frame at medium width. A still EXTRACTED from the video,
+  // MULTIMEDIA_KIND_VIDEO (hosted by Wink) only: poster frame at medium width. A still EXTRACTED from the video,
   // so like `thumbnail` it is an image and follows `image_format`.
   MediaUrlVariant poster = 7;
 
